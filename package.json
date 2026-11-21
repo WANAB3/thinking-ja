@@ -1,0 +1,98 @@
+{
+  "name": "thinking-ja",
+  "version": "0.1.0",
+  "description": "Japanese translations of coding-agent thinking blocks, made by local translation models, for omp, pi, Claude Code, DSH and other harnesses",
+  "type": "module",
+  "license": "MIT",
+  "author": "WANAB3",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WANAB3/thinking-ja.git"
+  },
+  "homepage": "https://github.com/WANAB3/thinking-ja#readme",
+  "bugs": {
+    "url": "https://github.com/WANAB3/thinking-ja/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "omp",
+    "claude-code",
+    "deepseek-harness",
+    "dsh-plugin",
+    "thinking",
+    "translation",
+    "plamo"
+  ],
+  "bin": {
+    "thinking-ja": "dist/cli.js"
+  },
+  "main": "dist/dsh/host.js",
+  "exports": {
+    ".": "./dist/dsh/host.js",
+    "./client": "./dist/dsh/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.15"
+  },
+  "pi": {
+    "extensions": [
+      "./src/harness/pi/index.ts"
+    ]
+  },
+  "omp": {
+    "extensions": [
+      "./src/harness/omp/index.ts"
+    ]
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-chat"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "bun build src/cli.ts --target node --outfile dist/cli.js && bun scripts/build-dsh.ts",
+    "prepublishOnly": "bun run build && bun test",
+    "test": "bun test",
+    "test:claude": "bun scripts/test-claude-mod.ts",
+    "typecheck": "tsc --noEmit",
+    "typecheck:claude": "tsc -p hooks"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.6.0",
+    "@earendil-works/pi-tui": "1.6.0",
+    "@oh-my-pi/pi-coding-agent": "19.1.0",
+    "@oh-my-pi/pi-tui": "19.1.0",
+    "@types/bun": "1.4.5",
+    "@types/react": "18",
+    "esbuild": "0.28.2",
+    "react": "18",
+    "typescript": "7.0.2"
+  }
+}

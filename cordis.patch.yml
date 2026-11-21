@@ -1,0 +1,5 @@
+# DeepSeek Harness bundle layer (package.json dsh.bundle.patch): mounts the
+# Host half of thinking-ja. The browser half is found through dsh.client.
+- insert:
+    - id: thinking-ja
+      name: thinking-ja

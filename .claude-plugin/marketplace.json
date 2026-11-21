@@ -1,0 +1,13 @@
+{
+  "name": "thinking-ja",
+  "owner": {
+    "name": "WANAB3"
+  },
+  "plugins": [
+    {
+      "name": "thinking-ja",
+      "source": "./",
+      "description": "Japanese translations of Claude's thinking summaries, made by a local translation model, shown under each thinking block"
+    }
+  ]
+}

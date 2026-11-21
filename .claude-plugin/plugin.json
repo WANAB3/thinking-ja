@@ -1,0 +1,17 @@
+{
+  "name": "thinking-ja",
+  "version": "0.1.0",
+  "description": "Japanese translations of Claude's thinking summaries, made by a local translation model, shown under each thinking block",
+  "author": {
+    "name": "WANAB3"
+  },
+  "homepage": "https://github.com/WANAB3/thinking-ja",
+  "repository": "https://github.com/WANAB3/thinking-ja",
+  "license": "MIT",
+  "keywords": [
+    "thinking",
+    "translation",
+    "japanese",
+    "plamo"
+  ]
+}
