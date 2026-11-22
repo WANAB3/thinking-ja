@@ -4,11 +4,11 @@
 
 | ハーネス | 訳の出る場所 | 導入 |
 |---|---|---|
-| [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp) | 思考ブロックの真下 | `omp plugin install thinking-ja` |
-| [pi](https://pi.dev) | 思考のあとに訳のカード | `pi install npm:thinking-ja` |
+| [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp) | 思考ブロックの真下 | `omp plugin install github:WANAB3/thinking-ja` |
+| [pi](https://pi.dev) | 思考のあとに訳のカード | `pi install git:github.com/WANAB3/thinking-ja` |
 | [Claude Code](https://code.claude.com) | 思考ブロックの真下の行（mod） | marketplace から（下記） |
-| [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) Web / Desktop | 思考（Think）を開いたとき、原文の下 | `dsh plugin --profile web add thinking-ja` |
-| Codex CLI ほか | 別ペインに訳を流す | `npx thinking-ja watch codex` |
+| [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) Web / Desktop | 思考（Think）を開いたとき、原文の下 | `dsh plugin --profile web add github:WANAB3/thinking-ja` |
+| Codex CLI ほか | 別ペインに訳を流す | `thinking-ja watch codex` |
 
 ## 1. 翻訳サーバーを動かす
 
@@ -39,7 +39,7 @@ llama-server -m ~/models-translate/plamo-3-translate-2b-Q4_K_M.gguf \
 `translators` は上から順に試され、失敗したら次へ進みます。確認するには:
 
 ```sh
-echo "I should read the config file first." | npx thinking-ja translate
+echo "I should read the config file first." | npx github:WANAB3/thinking-ja translate
 ```
 
 ### 他の翻訳モデルを使う
@@ -72,7 +72,7 @@ echo "I should read the config file first." | npx thinking-ja translate
 ### oh-my-pi (omp)
 
 ```sh
-omp plugin install thinking-ja
+omp plugin install github:WANAB3/thinking-ja
 ```
 
 新しく開いたセッションから、思考ブロックの真下に訳が出ます。`/thinking-ja` で表示を切り替えます。翻訳サーバーが落ちているときは、`@thinking-ja` ロール（未設定なら `@smol`）のモデルで訳します。この場合はモデルの利用料がかかります。
@@ -80,7 +80,7 @@ omp plugin install thinking-ja
 ### pi
 
 ```sh
-pi install npm:thinking-ja
+pi install git:github.com/WANAB3/thinking-ja
 ```
 
 思考が終わるたびに、その訳をカードとして会話に足します。カードはセッションに残り、再開しても訳し直しません。モデルには送られません。`/thinking-ja` で翻訳を止めたり再開したりできます。
@@ -103,7 +103,7 @@ pi install npm:thinking-ja
 ### DeepSeek Harness (DSH)
 
 ```sh
-dsh plugin --profile web add thinking-ja
+dsh plugin --profile web add github:WANAB3/thinking-ja
 ```
 
 DSH を再起動したあと、思考（Think）の行を開くと、原文の下に訳が出ます。訳は DSH の Host 経由で翻訳サーバーに頼み、セッションには書き込みません。
@@ -111,9 +111,10 @@ DSH を再起動したあと、思考（Think）の行を開くと、原文の�
 ### Codex CLI ほか（別ペインで見る）
 
 ```sh
-npx thinking-ja watch codex          # 今いるディレクトリの最新セッションを追う
-npx thinking-ja watch claude --backlog 3 --original
-npx thinking-ja watch dsh --file ~/.dsh/sessions/<...>/session.v4.jsonl.zstd
+npm install -g github:WANAB3/thinking-ja   # thinking-ja コマンドが入る
+thinking-ja watch codex          # 今いるディレクトリの最新セッションを追う
+thinking-ja watch claude --backlog 3 --original
+thinking-ja watch dsh --file ~/.dsh/sessions/<...>/session.v4.jsonl.zstd
 ```
 
 対応: `claude` / `codex` / `pi` / `omp` / `dsh`。セッションの記録ファイルを追い、新しい思考が書かれるたびに訳を出します。新しいセッションが始まると自動で乗り換えます。Codex は思考の要約だけを記録します。暗号化されたものは訳せません。
@@ -133,18 +134,18 @@ M4 Mac・PLaMo 3 Translate 2B（Q4_K_M）・1500 字 × 8 並列での実測で�
 
 ```sh
 bun install
-bun test               # コア・omp・ビューアのテスト
+bun run test           # ビルドしてから、コア・omp・ビューアのテスト
 bun run test:claude    # Claude Code mod のテスト（claude plugin test）
 bun run typecheck
 bun run typecheck:claude  # mod の型検査
-bun run build          # dist/cli.js と DSH 用の dist/dsh/*
 ```
 
-`typecheck:claude` は、Claude Code が `claude --plugin-dir .` で mod を読み込んだときに書き出す型（`.claude-plugin/types/`）を使います。
+- `dist/`（CLI と DSH 用のビルド結果）はコミットしています。GitHub から直接入れたとき、ビルドなしで動かすためです。`bun run test` は先にビルドするので、`src/` を変えたら `dist/` の差分も一緒にコミットしてください。
+- `typecheck:claude` は、Claude Code が `claude --plugin-dir .` で mod を読み込んだときに書き出す型（`.claude-plugin/types/`）を使います。
 
 ## English
 
-thinking-ja shows a Japanese translation of a coding agent's thinking, made by a local translation model (any OpenAI-compatible endpoint; PLaMo 3 Translate recommended). Translations are display-only: model input and transcripts are never changed. It ships an inline extension for oh-my-pi, a card extension for pi, a Claude Code mod (needs `"showThinkingSummaries": true`), a DeepSeek Harness Web/Desktop plugin, and `thinking-ja watch`, a side viewer that follows transcripts of Claude Code, Codex, pi, omp and DSH. Configure translators in `~/.config/thinking-ja/config.json` as shown above.
+thinking-ja shows a Japanese translation of a coding agent's thinking, made by a local translation model (any OpenAI-compatible endpoint; PLaMo 3 Translate recommended). Translations are display-only: model input and transcripts are never changed. It ships an inline extension for oh-my-pi, a card extension for pi, a Claude Code mod (needs `"showThinkingSummaries": true`), a DeepSeek Harness Web/Desktop plugin, and `thinking-ja watch`, a side viewer that follows transcripts of Claude Code, Codex, pi, omp and DSH. It is installed straight from GitHub with the commands above; configure translators in `~/.config/thinking-ja/config.json`.
 
 ## License
 

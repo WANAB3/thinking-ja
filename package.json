@@ -66,8 +66,8 @@
   },
   "scripts": {
     "build": "bun build src/cli.ts --target node --outfile dist/cli.js && bun scripts/build-dsh.ts",
-    "prepublishOnly": "bun run build && bun test",
-    "test": "bun test",
+    "prepublishOnly": "bun run test",
+    "test": "bun run build && bun test",
     "test:claude": "bun scripts/test-claude-mod.ts",
     "typecheck": "tsc --noEmit",
     "typecheck:claude": "tsc -p hooks"
