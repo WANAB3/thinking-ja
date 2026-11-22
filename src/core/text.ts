@@ -79,25 +79,51 @@ export const splitChunks = (text: string, max: number, level = 0): string[] => {
 	return chunks;
 };
 
-/**
- * A block cut into translation units as it streams: every paragraph already
- * closed by a blank line, cut with `splitChunks` when longer than `max`, and of
- * the paragraph still being written every piece but its growing last one.
- * `final` closes that paragraph too. A unit, once returned, comes back
- * byte-identical however the block grows, so each is translated exactly once,
- * as soon as it closes.
- */
-export const paragraphUnits = (text: string, max: number, final: boolean): string[] => {
-	const cut = final ? text.length : text.lastIndexOf("\n\n");
-	const units: string[] = [];
-	for (const paragraph of cut > 0 ? text.slice(0, cut).split("\n\n") : []) {
-		const trimmed = paragraph.trim();
-		if (trimmed) units.push(...splitChunks(trimmed, max));
+const SPACE = /\s/u;
+const SENTENCE_END = /[.!?。！？]/u;
+const CJK_END = /[。！？]/u;
+const CLOSING_QUOTE = /["'”’」』)\]]/u;
+const ABBREVIATION = /(?:\b(?:e\.g|i\.e|mr|mrs|ms|dr|vs)|\b[A-Z])\.$/i;
+
+/** Return only a sealed source span. Keep `end` as the next cursor, before its whitespace. */
+export function nextLiveUnit(source: string, from: number, max: number, final: boolean) {
+	let start = from;
+	let breaks = 0;
+	while (start < source.length && SPACE.test(source[start]!)) {
+		if (source[start] === "\n") breaks++;
+		start++;
 	}
-	const open = final ? "" : text.slice(cut < 0 ? 0 : cut + 2).trim();
-	if (open.length > max) units.push(...splitChunks(open, max).slice(0, -1));
-	return units;
-};
+	if (start >= source.length) return;
+	const before = from === 0 ? "" : breaks > 1 ? "\n\n" : breaks ? "\n" : "";
+	const span = (bound: number) => {
+		const text = source.slice(start, bound).trimEnd();
+		return { text, before, end: start + text.length };
+	};
+	const limit = Math.min(start + max, source.length);
+	let wordEnd = start;
+	for (let i = start; i < limit; i++) {
+		const c = source[i]!;
+		if (c === "\n" || c === "\r") return span(i);
+		if (SPACE.test(c)) {
+			if (!SPACE.test(source[i - 1]!)) wordEnd = i;
+			continue;
+		}
+		if (!SENTENCE_END.test(c)) continue;
+		let end = i + 1;
+		while (end < limit && (SENTENCE_END.test(source[end]!) || CLOSING_QUOTE.test(source[end]!))) end++;
+		// Wait for lookahead: a dot may still become part of a filename, a
+		// decimal, or an ellipsis. A newline always seals the preceding line.
+		if (end < source.length && (CJK_END.test(c) || SPACE.test(source[end]!)) &&
+			!(c === "." && ABBREVIATION.test(source.slice(Math.max(start, i - 5), i + 1)))) return span(end);
+		i = end - 1;
+	}
+	if (limit === source.length) return final ? span(limit) : undefined;
+	if (SPACE.test(source[limit]!)) return span(limit);
+	if (wordEnd > start) return span(wordEnd);
+	// A single astral character is indivisible even when the configured cap is one.
+	const surrogate = source.charCodeAt(limit) >= 0xdc00 && source.charCodeAt(limit) <= 0xdfff;
+	return span(surrogate ? (limit - start > 1 ? limit - 1 : limit + 1) : limit);
+}
 
 /** FNV-1a over the text, salted with its length: a stable cache key. */
 export const hashText = (text: string): string => {

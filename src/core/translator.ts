@@ -31,14 +31,49 @@ const fillTemplate = (value: unknown, vars: TemplateVars): unknown => {
 };
 
 /** `choices[0].message.content` of a chat reply, or `choices[0].text` of a completions reply. */
-const replyText = (reply: unknown, chat: boolean): unknown => {
-	if (!reply || typeof reply !== "object" || !("choices" in reply)) return undefined;
+const replyText = (reply: unknown, chat: boolean, requireComplete: boolean): unknown => {
+	if (!reply || typeof reply !== "object") return undefined;
+	if (requireComplete && "error" in reply && reply.error != null) {
+		throw new Error(`translation error: ${JSON.stringify(reply.error).slice(0, 200)}`);
+	}
+	if (!("choices" in reply)) return undefined;
 	if (!Array.isArray(reply.choices)) return undefined;
 	const choice: unknown = reply.choices[0];
 	if (!choice || typeof choice !== "object") return undefined;
+	if (requireComplete && "finish_reason" in choice && choice.finish_reason != null && choice.finish_reason !== "stop") {
+		throw new Error(`translation ended with ${String(choice.finish_reason)}`);
+	}
 	if (!chat) return "text" in choice ? choice.text : undefined;
 	const message = "message" in choice ? choice.message : undefined;
 	return message && typeof message === "object" && "content" in message ? message.content : undefined;
+};
+
+/** Builds the shared request body without choosing a transport. */
+export const translationRequestBody = (text: string, translator: Translator): Record<string, unknown> => {
+	const vars: TemplateVars = { text, source_lang: sourceLang(text) };
+	const request = {
+		...(translator.model === undefined ? {} : { model: translator.model }),
+		temperature: 0,
+		max_tokens: MAX_TOKENS,
+		...(translator.stop === undefined ? {} : { stop: translator.stop }),
+		...(translator.prompt === undefined ? { messages: translator.messages } : { prompt: translator.prompt }),
+		...translator.body,
+	};
+	return fillTemplate(request, vars) as Record<string, unknown>;
+};
+
+/** Validates an HTTP reply and extracts only the requested translation text. */
+export const translationReplyText = (
+	reply: { status: number; text: string },
+	translator: Translator,
+	options?: { requireComplete: boolean },
+): string => {
+	if (reply.status < 200 || reply.status >= 300) {
+		throw new Error(`${translator.url} answered HTTP ${reply.status}: ${reply.text.slice(0, 200)}`);
+	}
+	const out = replyText(JSON.parse(reply.text), translator.prompt === undefined, options?.requireComplete ?? false);
+	if (typeof out !== "string") throw new Error(`${translator.url} replied without text`);
+	return out;
 };
 
 /**
@@ -50,21 +85,5 @@ export const requestTranslation = async (
 	translator: Translator,
 	post: HttpPost,
 	signal?: AbortSignal,
-): Promise<string> => {
-	const vars: TemplateVars = { text, source_lang: sourceLang(text) };
-	const request = {
-		...(translator.model === undefined ? {} : { model: translator.model }),
-		temperature: 0,
-		max_tokens: MAX_TOKENS,
-		...(translator.stop === undefined ? {} : { stop: translator.stop }),
-		...(translator.prompt === undefined ? { messages: translator.messages } : { prompt: translator.prompt }),
-		...translator.body,
-	};
-	const reply = await post(translator.url, JSON.stringify(fillTemplate(request, vars)), signal);
-	if (reply.status < 200 || reply.status >= 300) {
-		throw new Error(`${translator.url} answered HTTP ${reply.status}: ${reply.text.slice(0, 200)}`);
-	}
-	const out = replyText(JSON.parse(reply.text), translator.prompt === undefined);
-	if (typeof out !== "string") throw new Error(`${translator.url} replied without text`);
-	return out;
-};
+): Promise<string> =>
+	translationReplyText(await post(translator.url, JSON.stringify(translationRequestBody(text, translator)), signal), translator);

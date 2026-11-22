@@ -2,13 +2,8 @@ import { stripVTControlCharacters } from "node:util";
 import type { ExtensionUIContext, Text } from "@oh-my-pi/pi-coding-agent";
 import type { Component } from "@oh-my-pi/pi-tui";
 
-/** Text is re-exported by pi-coding-agent and therefore available in pi.pi. */
-type PanelHost = { Text: typeof Text };
-type PanelUI = Pick<ExtensionUIContext, "setWidget" | "custom">;
-
-const WIDGET_KEY = "thinking-ja-caption";
-const CAPTION_ROWS = 3;
-const EMPTY_ROWS = ["", "", ""];
+type TextHost = { Text: typeof Text };
+type ReaderUI = Pick<ExtensionUIContext, "custom">;
 
 /** Strip terminal commands before expanding whitespace; retain only printable text and newlines. */
 function plainText(text: string): string {
@@ -25,64 +20,112 @@ function columns(width: number): number {
 }
 
 /**
- * Three physical caption rows, mounted only by an explicit enable. Updates never
- * replace the widget, editor, or transcript. Disable/dispose reclaim its rows.
- * The reader freezes its input at invocation and uses the host's text wrapping.
- * Default reader keys: arrows, PageUp/PageDown, Home/End, Escape; host remaps apply.
+ * Reserve rows from visible English before any Japanese arrives. The common
+ * ASCII append path only counts the new source characters; translated tokens
+ * never re-wrap the source. Non-ASCII source uses the host's Unicode wrapper.
  */
-export function createTranslationPanel(ui: PanelUI, host: PanelHost): {
-	setEnabled(value: boolean): void;
-	setCaption(text: string): void;
+export function createInlineTranslation(
+	host: TextHost,
+	source: string,
+	style: (line: string) => string,
+	enabled: () => boolean,
+): Component & { setSource(source: string): void; setTranslation(text: string, final: boolean): void } {
+	const original = new host.Text("", 0, 0);
+	const translated = new host.Text("", 0, 0);
+	let rawSource = "";
+	let hasSource = false;
+	let rawAscii = true;
+	let visibleAscii = true;
+	let lineLengths = [0];
+	let sourceDirty = true;
+	let previousWidth = -1;
+	let reservation = 0;
+	let finalHeight = 0;
+	let translation = "";
+	let final = false;
+
+	const setSource = (next: string) => {
+		if (next === rawSource) return;
+		const suffix = rawAscii && next.startsWith(rawSource) ? next.slice(rawSource.length) : undefined;
+		if (suffix !== undefined && /^[\x20-\x7e\n]*$/.test(suffix)) {
+			for (let i = 0; i < suffix.length; i++) {
+				if (suffix.charCodeAt(i) === 10) lineLengths.push(0);
+				else lineLengths[lineLengths.length - 1]!++;
+			}
+			hasSource = next.length > 0;
+		} else {
+			const visible = plainText(next);
+			rawAscii = /^[\x20-\x7e\n]*$/.test(next);
+			visibleAscii = /^[\x20-\x7e\n]*$/.test(visible);
+			hasSource = visible.length > 0;
+			if (visibleAscii) lineLengths = visible.split("\n").map((line) => line.length);
+			else original.setText(visible);
+		}
+		rawSource = next;
+		sourceDirty = true;
+	};
+	setSource(source);
+
+	return {
+		setSource,
+		setTranslation(text, complete) {
+			const next = plainText(text);
+			if (translation !== next) {
+				translation = next;
+				translated.setText(next);
+			}
+			final = complete;
+		},
+		render(width) {
+			if (!enabled()) return [];
+			const available = columns(width);
+			if (available === 0) return [];
+			if (previousWidth !== available) {
+				previousWidth = available;
+				reservation = 0;
+				finalHeight = 0;
+				sourceDirty = true;
+			}
+			if (sourceDirty) {
+				// Twenty percent narrower than the real column budget leaves room
+				// for Japanese and English word-wrap slack without a fixed cap.
+				const estimateWidth = Math.max(1, Math.floor(available * 0.8));
+				const estimated = !hasSource ? 0 : visibleAscii
+					? lineLengths.reduce((rows, length) => rows + Math.max(1, Math.ceil(length / estimateWidth)), 0)
+					: original.render(Math.max(2, estimateWidth)).length;
+				reservation = Math.max(reservation, estimated);
+				sourceDirty = false;
+			}
+			// A wide glyph cannot fit in one terminal column. Leave its reserved
+			// space blank, retaining the original text for the next usable width.
+			const wrapped = translation && available >= 2 ? translated.render(available) : [];
+			if (final) finalHeight = Math.max(finalHeight, wrapped.length);
+			const height = Math.max(reservation, finalHeight);
+			return Array.from({ length: height }, (_, index) => {
+				const row = wrapped[index];
+				return row ? style(row) : "";
+			});
+		},
+		invalidate() {
+			original.invalidate();
+			translated.invalidate();
+			sourceDirty = true;
+		},
+	};
+}
+
+/**
+ * The explicit reader freezes its input and uses the host's text wrapping.
+ * Default keys: arrows, PageUp/PageDown, Home/End, Escape; host remaps apply.
+ */
+export function createTranslationReader(ui: ReaderUI, host: TextHost): {
 	show(blocks: readonly string[]): Promise<void>;
 	dispose(): void;
 } {
-	let enabled = false;
 	let disposed = false;
-	let caption = "";
-	let requestRender: (() => void) | undefined;
 	let reader: { promise: Promise<void>; abort: AbortController } | undefined;
-	const preview = new host.Text("", 0, 0);
-	const overflow = new host.Text("… /thinking-ja show", 0, 0);
-	const widget: Component = {
-		render(width) {
-			const available = columns(width);
-			if (!caption || available === 0) return EMPTY_ROWS;
-			// A two-cell grapheme cannot fit in a one-cell terminal. Do not let the
-			// host wrapper's oversized grapheme create a fourth physical row.
-			if (available === 1) return [".", "", ""];
-			const wrapped = preview.render(available);
-			const rows = Array.from({ length: CAPTION_ROWS }, (_, index) => wrapped[index] ?? "");
-			if (wrapped.length > CAPTION_ROWS) rows[2] = overflow.render(available)[0] ?? "…";
-			return rows;
-		},
-		invalidate() {
-			preview.invalidate();
-			overflow.invalidate();
-		},
-	};
 
 	return {
-		setEnabled(value) {
-			if (disposed || enabled === value) return;
-			enabled = value;
-			if (enabled) {
-				ui.setWidget(WIDGET_KEY, (tui) => {
-					requestRender = () => tui.requestRender();
-					return widget;
-				}, { placement: "aboveEditor" });
-			} else {
-				ui.setWidget(WIDGET_KEY, undefined);
-				requestRender = undefined;
-			}
-		},
-		setCaption(text) {
-			if (disposed) return;
-			const next = plainText(text);
-			if (caption === next) return;
-			caption = next;
-			preview.setText(caption);
-			requestRender?.();
-		},
 		show(blocks) {
 			if (disposed) return Promise.resolve();
 			if (reader) return reader.promise;
@@ -91,7 +134,7 @@ export function createTranslationPanel(ui: PanelUI, host: PanelHost): {
 			const abort = new AbortController();
 			const promise = ui.custom<void>((tui, _theme, keybindings, done) => {
 				const body = new host.Text(snapshot, 0, 0);
-				// Open where the subtitle came from, not at the start of a long session.
+				// Start at the newest translated block, not the session's beginning.
 				let newest = pages.length > 1 ? new host.Text(pages[pages.length - 1]!, 0, 0) : undefined;
 				const title = new host.Text("日本語訳", 0, 0);
 				const help = new host.Text("↑↓ 移動 · PgUp/PgDn · Home/End · Esc 閉じる", 0, 0);
@@ -155,9 +198,6 @@ export function createTranslationPanel(ui: PanelUI, host: PanelHost): {
 			if (disposed) return;
 			disposed = true;
 			reader?.abort.abort();
-			if (enabled) ui.setWidget(WIDGET_KEY, undefined);
-			enabled = false;
-			requestRender = undefined;
 		},
 	};
 }

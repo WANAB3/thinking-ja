@@ -1,14 +1,13 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { type ChunkAttempt, chunkPlan, translateBlock, translateChunk, translatorAttempts } from "../../core/block.ts";
+import { type ChunkAttempt, chunkPlan, translateBlock, translateChunk } from "../../core/block.ts";
 import type { Config } from "../../core/config.ts";
-import { fetchPost } from "../../core/http.ts";
+import { requestStreamingTranslation } from "../../core/http.ts";
 import { configPath, loadConfig } from "../../core/load.ts";
-import { hashText, paragraphUnits, shouldTranslate, toLines } from "../../core/text.ts";
-import { createTranslationPanel } from "./panel.ts";
+import { hashText, nextLiveUnit, plainText, shouldTranslate } from "../../core/text.ts";
+import { createInlineTranslation, createTranslationReader } from "./panel.ts";
 
-// omp standalone only provides its SDK/TUI runtime through pi.pi. The thinking
-// renderer observes *visible* text and always returns undefined. All translation
-// output goes to the fixed-height widget or the reader the user opens explicitly.
+// Only the host's visible thinking goes to a translator. The mounted view is
+// display-only; neither English nor Japanese is written into a model message.
 
 /** Coalesce the final renderer flush and back off while MAX_INFLIGHT is full. */
 const DEBOUNCE_MS = 500;
@@ -22,12 +21,8 @@ const MAX_TRANSLATIONS = 2000;
 const MAX_CHUNKS = 512;
 /** Deadline for one LLM-role translation. */
 const REQUEST_TIMEOUT_MS = 60_000;
-/**
- * Largest unit a live block is translated in, below the translator's own
- * `chunkChars`. Translations show in order, so one long unit holds back every
- * paragraph after it; 500 chars is a few seconds of a local 2B translator.
- */
-const UNIT_CHARS = 500;
+/** An unpunctuated paragraph still gets a first translation while the author is thinking. */
+const UNIT_CHARS = 240;
 /**
  * Dedicated translation model role, mapped in config.yml
  * (`modelRoles.thinking-ja: <provider>/<model-id>`) or from `/model`'s Roles
@@ -73,7 +68,7 @@ const SYSTEM_PROMPT =
 
 type SubSessionEvent = {
 	type?: string;
-	message?: { content?: Array<{ type?: string; text?: string }> };
+	message?: { stopReason?: string; content?: Array<{ type?: string; text?: string }> };
 	assistantMessageEvent?: { type?: string; delta?: string };
 };
 
@@ -109,15 +104,21 @@ type Runtime = {
 
 /* ------------------------------------------------------------------- state */
 
-type Finished = { status: "done"; lines: string[]; caption: string };
-type Translation = Finished | { status: "pending" | "error" };
-type Unit = { text: string; key: string; ja?: string };
+type Translation = { status: "done"; text: string } | { status: "pending" | "error" };
+type Inline = ReturnType<typeof createInlineTranslation>;
+type Unit = { text: string; key: string; before: string; ja?: string };
+type Job = { text: string; key: string; draft: string };
 type Block = {
 	order: number;
 	text: string;
 	hash: string;
 	final: boolean;
 	whole: boolean;
+	view: Inline;
+	timestamp?: number;
+	cursor: number;
+	prefix: string;
+	drawn: string;
 	units: Unit[];
 	shown: number;
 	timer?: unknown;
@@ -182,28 +183,30 @@ const itemPairs = (item: unknown): unknown[] => {
 function openSession(pi: ExtensionAPI, context: ExtensionContext, config: Config | undefined) {
 	const runtime = context as unknown as Runtime;
 	const host = pi.pi as unknown as HostExports;
-	const panel = createTranslationPanel(context.ui, pi.pi);
+	const reader = createTranslationReader(context.ui, pi.pi);
 	const sessionAbort = new AbortController();
 	const translators = config?.translators ?? [];
 	const plan = chunkPlan(translators);
 	const unitChars = Math.min(UNIT_CHARS, plan.chunkChars);
-	const attempts = translatorAttempts(translators, fetchPost);
 	const translations = new Map<string, Translation>();
 	const chunkTranslations = new Map<string, string>();
-	const history = new Map<number, string[]>();
+	const history = new Map<number, string>();
+	const historyViews = new Map<string, Inline>();
 	const active = new Set<Block>();
 	const slots = new Map<number, Slot>();
 	// A frame may arrive before the stream event that identifies it.
-	const unbound = new Map<number, string>();
-	const unitQueue: Unit[] = [];
-	const unitsPending = new Set<string>();
+	const unbound = new Map<number, { text: string; view: Inline }>();
+	const unitQueue: Job[] = [];
+	const unitsPending = new Map<string, Job>();
 	const unitsFailed = new Set<string>();
+	const replay = new Set<number>();
 	let unitsActive = 0;
 	let inFlight = 0;
 	let order = 0;
-	let focus = 0;
+	let replyTimestamp: number | undefined;
+	let redraw: (() => void) | undefined;
+	let dim = (text: string) => text;
 	let streaming = false;
-	let sawReply = false;
 	let enabled = true;
 	let subSessionSeq = 0;
 
@@ -212,11 +215,15 @@ function openSession(pi: ExtensionAPI, context: ExtensionContext, config: Config
 		if (map.size > cap) map.delete(map.keys().next().value!);
 	}
 
-	const finished = (lines: string[], caption = lines.at(-1) ?? ""): Finished => ({ status: "done", lines, caption });
-	function present(block: Block, state: Finished) {
-		remember(history, block.order, state.lines, MAX_TRANSLATIONS);
-		// A late result belongs in the reader, not over a newer block's subtitle.
-		if (block.order === focus) panel.setCaption(state.caption);
+	function makeView(text: string): Inline {
+		return createInlineTranslation(pi.pi, text, line => dim(line), () => enabled && !sessionAbort.signal.aborted);
+	}
+
+	function draw(block: Block, ja: string, complete: boolean) {
+		if (!complete && block.drawn === ja) return;
+		block.drawn = ja;
+		block.view.setTranslation(plainText(ja), complete);
+		redraw?.();
 	}
 
 	function settle(hash: string, state: Translation, sourceOrder: number) {
@@ -225,7 +232,7 @@ function openSession(pi: ExtensionAPI, context: ExtensionContext, config: Config
 		remember(translations, hash, state, MAX_TRANSLATIONS);
 		if (state.status === "done" && previous?.status !== "done") {
 			try {
-				pi.appendEntry(CACHE_TYPE, { hash, ja: state.lines.join("\n"), v: CACHE_VERSION, order: sourceOrder });
+				pi.appendEntry(CACHE_TYPE, { hash, ja: state.text, v: CACHE_VERSION, order: sourceOrder });
 			} catch (error) {
 				pi.logger.warn(`thinking-ja: cache persist failed (${hash}): ${String(error)}`);
 			}
@@ -240,7 +247,24 @@ function openSession(pi: ExtensionAPI, context: ExtensionContext, config: Config
 		clearTimer(block);
 		active.delete(block);
 		block.units = [];
-		if (state.status === "done") present(block, state);
+		if (state.status === "done") {
+			remember(history, block.order, state.text, MAX_TRANSLATIONS);
+			remember(historyViews, block.hash, block.view, 200);
+			draw(block, state.text, true);
+			// Where host reply redraws are enabled, refresh even retired rows once,
+			// on completion only. Never rebuild scrollback for individual tokens.
+			const stamp = block.timestamp;
+			if (stamp !== undefined && !replay.has(stamp)) {
+				replay.add(stamp);
+				queueMicrotask(() => {
+					replay.delete(stamp);
+					if (enabled && !sessionAbort.signal.aborted) context.ui.rerenderMessage(stamp);
+				});
+			}
+		} else {
+			block.view.setSource("");
+			draw(block, "", true);
+		}
 	}
 
 	/* ---------------------------------------------------------- translation */
@@ -299,6 +323,8 @@ function openSession(pi: ExtensionAPI, context: ExtensionContext, config: Config
 					return;
 				}
 				if (event.type !== "turn_end") return;
+				const reason = event.message?.stopReason;
+				if (reason && reason !== "stop") return finish(() => reject(new Error(`translation ended with ${reason}`)));
 				let joined = "";
 				for (const part of event.message?.content ?? []) {
 					if (part.type === "text" && part.text) joined += part.text;
@@ -338,7 +364,6 @@ function openSession(pi: ExtensionAPI, context: ExtensionContext, config: Config
 	 */
 	const translate = async (text: string, hash: string, sourceOrder: number) => {
 		const wholeAttempts: ChunkAttempt[] = [
-			...attempts,
 			(chunk) => requestModelTranslation(chunk, true),
 			(chunk) => requestModelTranslation(chunk, false),
 		];
@@ -371,7 +396,7 @@ function openSession(pi: ExtensionAPI, context: ExtensionContext, config: Config
 			pi.logger.debug(`thinking-ja: abandoned translation while disabled (${hash})`);
 			return;
 		}
-		settle(hash, finished(toLines(ja)), sourceOrder);
+		settle(hash, { status: "done", text: plainText(ja) }, sourceOrder);
 	};
 
 	function clearTimer(block: Block) {
@@ -393,17 +418,22 @@ function openSession(pi: ExtensionAPI, context: ExtensionContext, config: Config
 		}, DEBOUNCE_MS);
 	}
 
-	function setUnits(block: Block, closeParagraph = block.final) {
+	function setUnits(block: Block, source = block.text) {
 		if (block.whole) return;
-		const units = paragraphUnits(block.text, unitChars, closeParagraph);
-		let kept = 0;
-		while (kept < units.length && units[kept] === block.units[kept]?.text) kept++;
-		block.shown = Math.min(block.shown, kept);
-		block.units.length = kept;
-		for (let i = kept; i < units.length; i++) {
-			const text = units[i]!;
-			block.units.push({ text, key: hashText(text) });
+		for (; ;) {
+			const span = nextLiveUnit(source, block.cursor, unitChars, block.final);
+			if (!span) return;
+			block.cursor = span.end;
+			block.units.push({ text: span.text, before: span.before, key: hashText(span.text) });
 		}
+	}
+
+	// Only the first unfinished unit is visible. Faster later requests and
+	// their drafts cannot jump ahead of it or move already readable sentences.
+	function drawDraft(block: Block) {
+		const next = block.units[block.shown];
+		const draft = next && unitsPending.get(next.key)?.draft;
+		draw(block, draft ? block.prefix + next.before + draft : block.prefix, false);
 	}
 
 	function refresh(block: Block) {
@@ -413,51 +443,58 @@ function openSession(pi: ExtensionAPI, context: ExtensionContext, config: Config
 		}
 		if (!enabled) return;
 		if (block.whole) return scheduleWhole(block);
-		let ready = 0;
-		for (const unit of block.units) {
+		for (let i = block.shown; i < block.units.length; i++) {
+			const unit = block.units[i]!;
 			unit.ja ??= chunkTranslations.get(unit.key);
 			if (unit.ja !== undefined) {
-				if (block.units[ready] === unit) ready++;
+				if (i === block.shown) {
+					block.prefix += unit.before + unit.ja;
+					block.shown++;
+				}
 			} else if (unitsFailed.has(unit.key)) {
 				block.whole = true;
+				draw(block, block.prefix, false);
 				return scheduleWhole(block);
 			} else if (!unitsPending.has(unit.key)) {
-				unitsPending.add(unit.key);
-				unitQueue.push(unit);
+				const job = { text: unit.text, key: unit.key, draft: "" };
+				unitsPending.set(unit.key, job);
+				unitQueue.push(job);
 			}
 		}
 		pumpUnits();
-		const complete = block.final && ready === block.units.length;
-		if (ready === 0 || (!complete && ready === block.shown)) return;
-		block.shown = ready;
-		const lines: string[] = [];
-		for (let i = 0; i < ready; i++) lines.push(...toLines(block.units[i]!.ja!));
-		const state = finished(lines, toLines(block.units[ready - 1]!.ja!).join("\n"));
-		if (complete) settle(block.hash, state, block.order);
-		else present(block, state);
+		if (block.final && block.shown && block.shown === block.units.length) {
+			settle(block.hash, { status: "done", text: plainText(block.prefix) }, block.order);
+		} else drawDraft(block);
 	}
 
 	function pumpUnits() {
 		while (enabled && unitsActive < plan.concurrency && unitQueue.length) {
-			const unit = unitQueue.shift()!;
+			const job = unitQueue.shift()!;
 			unitsActive++;
-			void translateChunk(unit.text, {
-				attempts,
+			const publish = (delta: string) => {
+				job.draft += delta;
+				if (!enabled || sessionAbort.signal.aborted) return;
+				for (const block of active) {
+					if (!block.whole && block.units[block.shown]?.key === job.key) drawDraft(block);
+				}
+			};
+			void translateChunk(job.text, {
+				attempts: translators.map((translator) => (chunk, signal) => {
+					if (job.draft) { job.draft = ""; publish(""); }
+					return requestStreamingTranslation(chunk, translator, signal, publish);
+				}),
 				signal: sessionAbort.signal,
 				active: () => enabled,
 				onAttemptError: (error, attempt) =>
-					pi.logger.debug(`thinking-ja: paragraph attempt ${attempt} failed: ${String(error)}`),
+					pi.logger.debug(`thinking-ja: live attempt ${attempt} failed: ${String(error)}`),
 			}).then((ja) => {
-				if (ja !== undefined) {
-					unit.ja = ja;
-					remember(chunkTranslations, unit.key, ja, MAX_CHUNKS);
-				}
+				if (ja !== undefined) remember(chunkTranslations, job.key, ja, MAX_CHUNKS);
 			}, (error: unknown) => {
-				unitsFailed.add(unit.key);
-				pi.logger.debug(`thinking-ja: paragraph translation gave up: ${String(error)}`);
+				unitsFailed.add(job.key);
+				pi.logger.debug(`thinking-ja: live translation gave up: ${String(error)}`);
 			}).finally(() => {
 				unitsActive--;
-				unitsPending.delete(unit.key);
+				unitsPending.delete(job.key);
 				if (sessionAbort.signal.aborted) return;
 				for (const waiting of active) refresh(waiting);
 				pumpUnits();
@@ -465,8 +502,11 @@ function openSession(pi: ExtensionAPI, context: ExtensionContext, config: Config
 		}
 	}
 
-	function newBlock(text: string, rank: number, whole: boolean): Block {
-		const block: Block = { order: rank, text, hash: hashText(text), final: false, whole, units: [], shown: 0 };
+	function newBlock(text: string, rank: number, whole: boolean, view = makeView(text)): Block {
+		const block: Block = {
+			order: rank, text, hash: hashText(text), final: false, whole, view,
+			cursor: 0, units: [], shown: 0, prefix: "", drawn: "",
+		};
 		active.add(block);
 		return block;
 	}
@@ -481,8 +521,11 @@ function openSession(pi: ExtensionAPI, context: ExtensionContext, config: Config
 			refresh(block);
 		};
 		if (slot.raw.trim() === block.text) close();
-		// A display frame may still be revealing/folding the final snapshot.
-		else if (block.timer === undefined) block.timer = runtime.setTimeout(close, DEBOUNCE_MS);
+		// A delayed reveal of plain text still owes us a visible suffix. Don't
+		// persist a translation of its prefix as if the block had finished.
+		else if ((!slot.raw.trimStart().startsWith(block.text) || /```|~~~|<!--/.test(slot.raw)) && block.timer === undefined) {
+			block.timer = runtime.setTimeout(close, DEBOUNCE_MS);
+		}
 	}
 
 	function identify(local: number, text: string): Slot | undefined {
@@ -504,22 +547,32 @@ function openSession(pi: ExtensionAPI, context: ExtensionContext, config: Config
 		return exact ?? seen ?? (matches === 1 ? candidate : undefined);
 	}
 
-	function observe(slot: Slot, text: string) {
-		focus = Math.max(focus, slot.order);
+	function observe(slot: Slot, text: string, previousView?: Inline): Inline {
 		let block = slot.block;
 		if (!block || block.text !== text) {
-			if (!block) block = slot.block = newBlock(text, slot.order, !translators.length);
-			else {
+			if (!block) {
+				block = slot.block = newBlock(text, slot.order, !translators.length, previousView);
+				block.timestamp = replyTimestamp;
+			} else {
 				clearTimer(block);
+				if (block.final || !text.startsWith(block.text)) {
+					if (historyViews.get(block.hash) === block.view) historyViews.delete(block.hash);
+					block.cursor = block.shown = 0;
+					block.units.length = 0;
+					block.prefix = "";
+					draw(block, "", false);
+				}
+				block.view.setSource(text);
 				block.text = text;
 				block.hash = hashText(text);
 				block.final = false;
 				active.add(block);
 			}
-			setUnits(block, slot.raw.endsWith("\n\n") && slot.raw.trim() === text);
+			setUnits(block, slot.raw.trim() === text ? slot.raw.trimStart() : text);
 			if (!slot.ended || slot.raw.trim() !== text) refresh(block);
 		}
 		seal(slot);
+		return block.view;
 	}
 
 	function snapshot(parts: readonly Part[], index: number, ended: boolean) {
@@ -536,16 +589,16 @@ function openSession(pi: ExtensionAPI, context: ExtensionContext, config: Config
 		slot.ended ||= ended;
 		const pending = unbound.get(slot.local);
 		if (pending) {
-			const owner = identify(slot.local, pending);
+			const owner = identify(slot.local, pending.text);
 			if (owner) {
 				unbound.delete(slot.local);
-				observe(owner, pending);
+				observe(owner, pending.text, pending.view);
 			}
 		}
 		const block = slot.block;
-		if (block && !slot.ended && !block.whole && slot.raw.endsWith("\n\n") && slot.raw.trim() === block.text) {
-			// Renderer trims blank lines, including a closed paragraph's delimiter.
-			setUnits(block, true);
+		if (block && !slot.ended && !block.whole && /\s$/.test(slot.raw) && slot.raw.trim() === block.text) {
+			// The renderer trims the space that seals a sentence ("Done. ").
+			setUnits(block, slot.raw.trimStart());
 			refresh(block);
 		}
 		seal(slot);
@@ -572,17 +625,16 @@ function openSession(pi: ExtensionAPI, context: ExtensionContext, config: Config
 			ja = parts.join("\n");
 		}
 		if (!ja) return false;
-		const state = finished(toLines(ja));
+		const state = { status: "done" as const, text: plainText(ja) };
 		remember(translations, hash, state, MAX_TRANSLATIONS);
 		const rank = item && typeof item === "object" && "order" in item ? item.order : undefined;
 		const position = typeof rank === "number" && Number.isSafeInteger(rank) && rank > 0 && !history.has(rank)
 			? rank : order + 1;
 		order = Math.max(order, position);
-		remember(history, position, state.lines, MAX_TRANSLATIONS);
+		remember(history, position, state.text, MAX_TRANSLATIONS);
 		return true;
 	};
 
-	panel.setEnabled(true);
 	{
 		let seeded = 0;
 		try {
@@ -599,15 +651,13 @@ function openSession(pi: ExtensionAPI, context: ExtensionContext, config: Config
 		} catch (error) {
 			pi.logger.warn(`thinking-ja: history seed failed: ${String(error)}`);
 		}
-		if (seeded) {
-			focus = order;
-			panel.setCaption(history.get(focus)?.at(-1) ?? "");
-		}
+		if (seeded) pi.logger.debug(`thinking-ja: restored ${seeded} translation(s)`);
 	}
 
 	return {
-		start(parts: readonly Part[]) {
-			streaming = sawReply = true;
+		start(parts: readonly Part[], timestamp: number) {
+			streaming = true;
+			replyTimestamp = timestamp;
 			slots.clear();
 			unbound.clear();
 			unitsFailed.clear();
@@ -622,40 +672,57 @@ function openSession(pi: ExtensionAPI, context: ExtensionContext, config: Config
 			streaming = false;
 			unbound.clear();
 		},
-		render(local: number, text: string) {
+		render(local: number, text: string, requestRender: () => void, style: (line: string) => string) {
+			redraw = requestRender;
+			dim = style;
 			if (!shouldTranslate(text)) return;
 			const slot = identify(local, text);
-			if (!enabled && !slot?.block) return;
 			if (slot) return observe(slot, text);
-			if (streaming) {
-				unbound.set(local, text);
-				return;
-			}
-			// Historical replay has no stream slots. Never let a replay steal
-			// the live caption; its complete translation is still in the reader.
 			const hash = hashText(text);
-			if (translations.has(hash)) return;
-			for (const block of active) if (block.hash === hash) return;
-			const block = newBlock(text, ++order, true);
-			if (!sawReply) focus = block.order;
+			const mounted = historyViews.get(hash);
+			if (mounted) return mounted;
+			const cached = translations.get(hash);
+			if (cached?.status === "error") return;
+			if (cached?.status === "done") {
+				const view = makeView(text);
+				view.setTranslation(cached.text, true);
+				remember(historyViews, hash, view, 200);
+				return view;
+			}
+			if (streaming) {
+				const pending = unbound.get(local);
+				if (pending && text.startsWith(pending.text)) {
+					pending.text = text;
+					pending.view.setSource(text);
+					return pending.view;
+				}
+				const view = makeView(text);
+				unbound.set(local, { text, view });
+				return view;
+			}
+			for (const block of active) if (block.hash === hash) return block.view;
+			const block = newBlock(text, ++order, !translators.length);
 			block.final = true;
+			setUnits(block);
 			refresh(block);
+			return block.view;
 		},
 		toggle() {
 			enabled = !enabled;
-			panel.setEnabled(enabled);
 			if (enabled) for (const block of active) refresh(block);
+			redraw?.();
 		},
 		show() {
-			const ordered = [...history].sort(([a], [b]) => a - b);
-			return panel.show(ordered.map(([, lines]) => lines.join("\n")));
+			const entries = new Map(history);
+			for (const block of active) if (block.drawn) entries.set(block.order, plainText(block.drawn));
+			return reader.show([...entries].sort(([a], [b]) => a - b).map(([, ja]) => ja));
 		},
 		dispose() {
 			sessionAbort.abort();
 			for (const block of active) clearTimer(block);
 			unitQueue.length = 0;
+			reader.dispose();
 			active.clear();
-			panel.dispose();
 		},
 	};
 }
@@ -677,7 +744,7 @@ export default function thinkingJa(pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", () => { session?.dispose(); session = undefined; });
 	pi.on("message_start", ({ message }) => {
-		if (message.role === "assistant") session?.start(message.content);
+		if (message.role === "assistant") session?.start(message.content, message.timestamp);
 	});
 	pi.on("message_update", ({ assistantMessageEvent: update }) => {
 		if (update.type === "thinking_start" || update.type === "thinking_delta" || update.type === "thinking_end") {
@@ -698,15 +765,13 @@ export default function thinkingJa(pi: ExtensionAPI) {
 	}));
 
 	pi.registerCommand("thinking-ja", {
-		description: "日本語字幕のオン・オフ。/thinking-ja show で訳の全文を読む",
+		description: "思考の直下に日本語訳を表示／停止。/thinking-ja show で訳の履歴を読む",
 		handler: async (args, ctx) => {
 			if (args.trim() === "show") await session?.show();
 			else if (!args.trim()) session?.toggle();
-			else ctx.ui.notify("字幕の切り替え: /thinking-ja　全文: /thinking-ja show", "info");
+			else ctx.ui.notify("翻訳の切り替え: /thinking-ja　履歴: /thinking-ja show", "info");
 		},
 	});
-	pi.registerAssistantThinkingRenderer(({ contentIndex, text }) => {
-		session?.render(contentIndex, text.trim());
-		return undefined;
-	});
+	pi.registerAssistantThinkingRenderer(({ contentIndex, text, requestRender }, theme) =>
+		session?.render(contentIndex, text.trim(), requestRender, line => theme.fg("dim", line)));
 }

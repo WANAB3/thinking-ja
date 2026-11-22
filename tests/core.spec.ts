@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { chunkPlan, translateBlock, translatorAttempts } from "../src/core/block.ts";
 import { parseConfig } from "../src/core/config.ts";
 import { fetchPost } from "../src/core/http.ts";
-import { paragraphUnits, shouldTranslate, splitChunks, toLines } from "../src/core/text.ts";
+import { nextLiveUnit, shouldTranslate, splitChunks, toLines } from "../src/core/text.ts";
 import { requestTranslation } from "../src/core/translator.ts";
 
 /** A fake OpenAI-compatible server: echoes `訳:` + the text it was asked to translate. */
@@ -85,15 +85,35 @@ describe("text gates", () => {
 		expect(b.every((chunk) => chunk.length <= 700)).toBe(true);
 	});
 
-	test("streaming units: closed paragraphs and settled pieces only, unchanged as the block grows", () => {
-		expect(paragraphUnits("Alpha.\n\nBeta is open", 100, false)).toEqual(["Alpha."]);
-		expect(paragraphUnits("Alpha.\n\nBeta is open", 100, true)).toEqual(["Alpha.", "Beta is open"]);
-		const long = "word ".repeat(80).trim();
-		const growing = paragraphUnits(`Alpha.\n\n${long}`, 100, false);
-		expect(growing.length).toBeGreaterThan(2);
-		expect(paragraphUnits(`Alpha.\n\n${long} more words here`, 100, false).slice(0, growing.length)).toEqual(growing);
-		expect(paragraphUnits(`Alpha.\n\n${long} end.\n\nGamma`, 100, false).slice(0, growing.length)).toEqual(growing);
-		expect(paragraphUnits(`Alpha.\n\n${long} end.`, 100, true).join(" ")).toBe(`Alpha. ${long} end.`);
+	test("a sentence seals before the next sentence finishes; punctuation and paragraph breaks survive", () => {
+		const first = "Read e.g. src/foo.ts and check version 1.2.";
+		const source = `${first} Then inspect it!\n\n最后一句。还在写`;
+		expect(nextLiveUnit(first, 0, 120, false)).toBeUndefined();
+		const one = nextLiveUnit(source, 0, 120, false)!;
+		expect(one.text).toBe(first);
+		const two = nextLiveUnit(source, one.end, 120, false)!;
+		expect(two).toMatchObject({ text: "Then inspect it!", before: "" });
+		const three = nextLiveUnit(source, two.end, 120, false)!;
+		expect(three).toMatchObject({ text: "最后一句。", before: "\n\n" });
+		expect(nextLiveUnit(source, three.end, 120, false)).toBeUndefined();
+		expect(nextLiveUnit(source, three.end, 120, true)?.text).toBe("还在写");
+	});
+
+	test("an unpunctuated stream yields stable, bounded pieces without splitting surrogate pairs or losing words", () => {
+		const source = "Read the toolbar configuration and preserve the path ".repeat(9).trim();
+		let cursor = 0;
+		const pieces: string[] = [];
+		for (let length = 1; length <= source.length; length++) {
+			const unit = nextLiveUnit(source.slice(0, length), cursor, 40, false);
+			if (!unit) continue;
+			expect(nextLiveUnit(source, cursor, 40, false)).toEqual(unit);
+			expect(unit.text.length).toBeLessThanOrEqual(40);
+			pieces.push(unit.text);
+			cursor = unit.end;
+		}
+		pieces.push(nextLiveUnit(source, cursor, 40, true)!.text);
+		expect(pieces.join(" ")).toBe(source);
+		expect(nextLiveUnit("🙂🙂🙂", 0, 1, false)?.text).toBe("🙂");
 	});
 });
 

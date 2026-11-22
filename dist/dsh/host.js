@@ -62,16 +62,23 @@ var fillTemplate = (value, vars) => {
   }
   return value;
 };
-var replyText = (reply, chat) => {
-  if (!reply || typeof reply !== "object" || !("choices" in reply)) return void 0;
+var replyText = (reply, chat, requireComplete) => {
+  if (!reply || typeof reply !== "object") return void 0;
+  if (requireComplete && "error" in reply && reply.error != null) {
+    throw new Error(`translation error: ${JSON.stringify(reply.error).slice(0, 200)}`);
+  }
+  if (!("choices" in reply)) return void 0;
   if (!Array.isArray(reply.choices)) return void 0;
   const choice = reply.choices[0];
   if (!choice || typeof choice !== "object") return void 0;
+  if (requireComplete && "finish_reason" in choice && choice.finish_reason != null && choice.finish_reason !== "stop") {
+    throw new Error(`translation ended with ${String(choice.finish_reason)}`);
+  }
   if (!chat) return "text" in choice ? choice.text : void 0;
   const message = "message" in choice ? choice.message : void 0;
   return message && typeof message === "object" && "content" in message ? message.content : void 0;
 };
-var requestTranslation = async (text, translator, post, signal) => {
+var translationRequestBody = (text, translator) => {
   const vars = { text, source_lang: sourceLang(text) };
   const request = {
     ...translator.model === void 0 ? {} : { model: translator.model },
@@ -81,14 +88,17 @@ var requestTranslation = async (text, translator, post, signal) => {
     ...translator.prompt === void 0 ? { messages: translator.messages } : { prompt: translator.prompt },
     ...translator.body
   };
-  const reply = await post(translator.url, JSON.stringify(fillTemplate(request, vars)), signal);
+  return fillTemplate(request, vars);
+};
+var translationReplyText = (reply, translator, options) => {
   if (reply.status < 200 || reply.status >= 300) {
     throw new Error(`${translator.url} answered HTTP ${reply.status}: ${reply.text.slice(0, 200)}`);
   }
-  const out = replyText(JSON.parse(reply.text), translator.prompt === void 0);
+  const out = replyText(JSON.parse(reply.text), translator.prompt === void 0, options?.requireComplete ?? false);
   if (typeof out !== "string") throw new Error(`${translator.url} replied without text`);
   return out;
 };
+var requestTranslation = async (text, translator, post, signal) => translationReplyText(await post(translator.url, JSON.stringify(translationRequestBody(text, translator)), signal), translator);
 
 // src/core/block.ts
 var DEFAULT_CHUNK_CHARS = 4e3;

@@ -20,6 +20,7 @@ let translatorDown = false;
 /** Texts the local translator endpoint was asked to translate. */
 let localRequests: string[] = [];
 const gates = new Map<string, Promise<void>>();
+const streams = new Map<string, ReadableStream<Uint8Array>>();
 const originalConfig = process.env.THINKING_JA_CONFIG;
 const realFetch = globalThis.fetch;
 globalThis.fetch = Object.assign(
@@ -28,6 +29,8 @@ globalThis.fetch = Object.assign(
 		const body = JSON.parse(String(init?.body)) as { prompt: string };
 		localRequests.push(body.prompt);
 		await gates.get(body.prompt);
+		const stream = streams.get(body.prompt);
+		if (stream) return new Response(stream, { headers: { "content-type": "text/event-stream" } });
 		return Response.json({ choices: [{ text: `ローカル訳:${body.prompt}` }] });
 	},
 	{ preconnect: realFetch.preconnect },
@@ -45,6 +48,7 @@ beforeEach(() => {
 	translatorDown = false;
 	localRequests = [];
 	gates.clear();
+	streams.clear();
 	process.env.THINKING_JA_CONFIG = join(configDir, "absent.json");
 });
 
@@ -60,7 +64,7 @@ function harness(branch: CacheEntry[] = []) {
 	let nextTimer = 0;
 	let renderer: (context: unknown, theme: unknown) => Component | undefined = () => undefined;
 	let command: (args: string) => Promise<void> = async () => { };
-	let widget: Component | undefined;
+	let inline: Component | undefined;
 	let reader = "";
 	let parts: Part[] = [];
 	const uiHost = { terminal: { rows: 60 }, requestRender() { } };
@@ -80,9 +84,7 @@ function harness(branch: CacheEntry[] = []) {
 		},
 		ui: {
 			notify() { },
-			setWidget(_key: string, factory?: (tui: typeof uiHost) => Component) {
-				widget = factory?.(uiHost);
-			},
+			rerenderMessage() { },
 			async custom(factory: (tui: typeof uiHost) => Component) {
 				reader = factory(uiHost).render(160).map(line => line.trimEnd()).join("\n");
 			},
@@ -130,7 +132,10 @@ function harness(branch: CacheEntry[] = []) {
 		},
 	};
 	thinkingJa(pi as unknown as ExtensionAPI);
-	const render = (text: string, local = 0) => renderer({ text, contentIndex: local, thinkingIndex: 0 }, {});
+	const render = (text: string, local = 0) => inline = renderer(
+		{ text, contentIndex: local, thinkingIndex: 0, requestRender: uiHost.requestRender },
+		{ fg: (_color: string, line: string) => line },
+	);
 	function update(text: string, index = 0, end = false) {
 		parts[index] = { type: "thinking", thinking: text };
 		const partial = { role: "assistant", content: parts };
@@ -147,7 +152,7 @@ function harness(branch: CacheEntry[] = []) {
 		},
 		tool() { parts.push({ type: "toolCall", id: `tool-${parts.length}` }); },
 		think(text: string) { update(text); return render(text); },
-		rows(width = 160) { return widget?.render(width).map(line => line.trimEnd()) ?? []; },
+		rows(width = 160) { return inline?.render(width).map(line => line.trimEnd()) ?? []; },
 		toggle() { return command(""); },
 		async readAll() { await command("show"); return reader; },
 		/** Settles pending async work, then runs due timers in order, settling after each. */
@@ -166,32 +171,37 @@ function harness(branch: CacheEntry[] = []) {
 	};
 }
 
-test("a delayed role translation changes neither transcript nor widget height", async () => {
+test("a delayed role translation fills the original block's preallocated rows", async () => {
 	const h = harness();
 	await h.emit("session_start");
-	const blank = h.rows();
-	expect(blank).toHaveLength(3);
+	expect(h.rows()).toEqual([]);
 	await h.emit("message_start");
-	expect(h.think(PREFIX)).toBeUndefined();
+	const view = h.think(PREFIX)!;
+	const blank = h.rows();
+	expect(blank.length).toBeGreaterThan(0);
+	expect(blank.join("")).toBe("");
 	await h.advance(2000);
 	expect(h.requests).toEqual([]);
 	expect(h.rows()).toEqual(blank);
-	expect(h.think(COMPLETE)).toBeUndefined();
+	expect(h.think(COMPLETE)).toBe(view);
+	const reserved = h.rows().length;
 	await h.emit("message_end");
 	await h.advance(500);
 	expect(h.requests).toEqual([COMPLETE]);
-	expect(h.rows()).toEqual([TRANSLATION, "", ""]);
-	expect(h.render(COMPLETE)).toBeUndefined();
+	expect(h.rows()).toHaveLength(reserved);
+	expect(h.rows()[0]).toBe(TRANSLATION);
+	expect(h.render(COMPLETE)).toBe(view);
 	expect(h.branch[0]?.data.ja).toBe(TRANSLATION);
 });
 
 test("resume and toggling reuse complete translations without paying again", async () => {
 	const first = harness();
 	await first.emit("session_start");
-	expect(first.render(COMPLETE)).toBeUndefined();
+	first.render(COMPLETE);
 	await first.advance(500);
 	const h = harness(first.branch);
 	await h.emit("session_start");
+	h.render(COMPLETE);
 	expect(h.rows()[0]).toBe(TRANSLATION);
 	await h.toggle();
 	expect(h.rows()).toEqual([]);
@@ -236,7 +246,7 @@ test("failed local service falls back after the visible block ends", async () =>
 	expect(h.rows()[0]).toBe(TRANSLATION);
 });
 
-test("completed paragraphs replace the subtitle, while the reader keeps both and replay is free", async () => {
+test("a completed paragraph remains under the same original after later paragraphs arrive and on replay", async () => {
 	process.env.THINKING_JA_CONFIG = configFile;
 	const h = harness();
 	await h.emit("session_start");
@@ -247,18 +257,19 @@ test("completed paragraphs replace the subtitle, while the reader keeps both and
 	h.think(first);
 	h.update(`${first}\n\n`);
 	await h.advance(0);
-	expect(h.rows()).toEqual([`ローカル訳:${first}`, "", ""]);
+	expect(h.rows().filter(Boolean)).toEqual([`ローカル訳:${first}`]);
 	expect(localRequests).toEqual([first]);
 	h.think(full);
 	h.update(full, 0, true);
 	await h.advance(0);
-	expect(h.rows()).toEqual([`ローカル訳:${second}`, "", ""]);
-	expect(await h.readAll()).toContain(`ローカル訳:${first}\nローカル訳:${second}`);
-	expect(h.branch[0]?.data.ja).toBe(`ローカル訳:${first}\nローカル訳:${second}`);
+	expect(h.rows().filter(Boolean)).toEqual([`ローカル訳:${first}`, `ローカル訳:${second}`]);
+	expect(await h.readAll()).toContain(`ローカル訳:${first}\n\nローカル訳:${second}`);
+	expect(h.branch[0]?.data.ja).toBe(`ローカル訳:${first}\n\nローカル訳:${second}`);
 	await h.emit("message_end");
 	await h.emit("message_start");
 	await h.emit("message_end");
-	expect(h.render(full)).toBeUndefined();
+	h.render(full);
+	expect(h.rows().filter(Boolean)).toEqual([`ローカル訳:${first}`, `ローカル訳:${second}`]);
 	await h.advance(1000);
 	expect(localRequests).toEqual([first, second]);
 	expect(h.requests).toEqual([]);
@@ -269,20 +280,22 @@ test("post-tool local index zero closes at global index two even before its firs
 	const h = harness();
 	await h.emit("session_start");
 	await h.emit("message_start");
-	const pre = `${PREFIX} This is before the tool.`;
-	const post = `${PREFIX} This is after the tool.`;
+	const pre = "The same reasoning prefix before the tool.";
+	const post = "The same reasoning prefix after the tool.";
 	const delayed = Promise.withResolvers<void>();
 	gates.set(pre, delayed.promise);
-	h.think(pre);
+	const earlier = h.think(pre)!;
 	h.update(pre, 0, true);
 	h.tool();
 	h.update(post, 2, true);
-	expect(h.render(post, 0)).toBeUndefined();
+	const later = h.render(post, 0)!;
 	await h.advance(0);
 	expect(h.rows()[0]).toBe(`ローカル訳:${post}`);
-	// Finishing older work must not steal the subtitle or reverse the reader.
+	expect(earlier.render(160).join("").trim()).toBe("");
 	delayed.resolve();
 	await h.advance(0);
+	expect(earlier.render(160).join("").trim()).toBe(`ローカル訳:${pre}`);
+	expect(later.render(160).join("").trim()).toBe(`ローカル訳:${post}`);
 	expect(h.rows()[0]).toBe(`ローカル訳:${post}`);
 	const all = await h.readAll();
 	expect(all.indexOf(pre)).toBeGreaterThanOrEqual(0);
@@ -303,4 +316,56 @@ test("folded or never-rendered provider text is not submitted to a translator", 
 	await h.advance(500);
 	expect(localRequests).toEqual([visible]);
 	expect(h.rows()[0]).toBe(`ローカル訳:${visible}`);
+});
+
+test("the first Japanese delta is visible before either stream ends; later sentences cannot overtake it", async () => {
+	process.env.THINKING_JA_CONFIG = configFile;
+	const first = "Check the source before making changes.";
+	const second = "Then inspect the tests.";
+	let writer!: ReadableStreamDefaultController<Uint8Array>;
+	streams.set(first, new ReadableStream({ start(c) { writer = c; } }));
+	const push = (data: unknown) => writer.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(data)}\n\n`));
+	const h = harness();
+	await h.emit("session_start");
+	await h.emit("message_start");
+	const full = `${first} ${second}`;
+	const view = h.think(full)!;
+	await h.advance(0);
+	expect(localRequests).toEqual([first]);
+	push({ choices: [{ index: 0, text: "まず原文を" }] });
+	await h.advance(0);
+	expect(view.render(80).join("").trim()).toBe("まず原文を");
+	expect(h.branch).toEqual([]);
+	h.update(full, 0, true);
+	await h.advance(0);
+	expect(localRequests).toEqual([first, second]);
+	expect(view.render(80).join("").trim()).toBe("まず原文を");
+	push({ choices: [{ index: 0, text: "確認する。", finish_reason: "stop" }] });
+	writer.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+	writer.close();
+	await h.advance(0);
+	const ja = `まず原文を確認する。ローカル訳:${second}`;
+	expect(view.render(160).join("").trim()).toBe(ja);
+	expect(h.branch.map(entry => entry.data.ja)).toEqual([ja]);
+});
+
+test("a truncated live unit is not stored or bought again while the role supplies its full replacement", async () => {
+	process.env.THINKING_JA_CONFIG = configFile;
+	const h = harness();
+	await h.emit("session_start");
+	await h.emit("message_start");
+	let send!: ReadableStreamDefaultController<Uint8Array>;
+	streams.set(PREFIX, new ReadableStream({ start(c) { send = c; } }));
+	const view = h.think(PREFIX)!;
+	h.update(PREFIX, 0, true);
+	await h.advance(0);
+	send.enqueue(new TextEncoder().encode('data: {"choices":[{"text":"途切れた仮訳"}]}\n\n'));
+	await h.advance(0);
+	expect(view.render(80).join("").trim()).toBe("途切れた仮訳");
+	send.enqueue(new TextEncoder().encode('data: {"choices":[{"text":"","finish_reason":"length"}]}\n\n'));
+	await h.advance(500);
+	expect(localRequests).toEqual([PREFIX]);
+	expect(h.requests).toEqual([PREFIX]);
+	expect(h.branch.map(entry => entry.data.ja)).toEqual([TRANSLATION]);
+	expect(view.render(80).join("").trim()).toBe(TRANSLATION);
 });
