@@ -111,13 +111,15 @@ DSH を再起動したあと、思考（Think）の行を開くと、原文の�
 ### Codex CLI ほか（別ペインで見る）
 
 ```sh
-npm install -g github:WANAB3/thinking-ja   # thinking-ja コマンドが入る
+npm install -g --install-links github:WANAB3/thinking-ja   # thinking-ja コマンドが入る
 thinking-ja watch codex          # 今いるディレクトリの最新セッションを追う
 thinking-ja watch claude --backlog 3 --original
 thinking-ja watch dsh --file ~/.dsh/sessions/<...>/session.v4.jsonl.zstd
 ```
 
 対応: `claude` / `codex` / `pi` / `omp` / `dsh`。セッションの記録ファイルを追い、新しい思考が書かれるたびに訳を出します。新しいセッションが始まると自動で乗り換えます。Codex は思考の要約だけを記録します。暗号化されたものは訳せません。
+
+`--install-links` を外すと、npm は消える一時フォルダへのリンクとして入れるため、コマンドが動きません。
 
 ## 速さの目安
 
