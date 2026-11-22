@@ -4,7 +4,7 @@
 
 | ハーネス | 訳の出る場所 | 導入 |
 |---|---|---|
-| [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp) | 思考ブロックの真下 | `omp plugin install github:WANAB3/thinking-ja` |
+| [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp) | 入力欄の上の固定字幕（3行） | `omp plugin install github:WANAB3/thinking-ja` |
 | [pi](https://pi.dev) | 思考のあとに訳のカード | `pi install git:github.com/WANAB3/thinking-ja` |
 | [Claude Code](https://code.claude.com) | 思考ブロックの真下の行（mod） | marketplace から（下記） |
 | [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) Web / Desktop | 思考（Think）を開いたとき、原文の下 | `dsh plugin --profile web add github:WANAB3/thinking-ja` |
@@ -75,7 +75,9 @@ echo "I should read the config file first." | npx github:WANAB3/thinking-ja tran
 omp plugin install github:WANAB3/thinking-ja
 ```
 
-新しく開いたセッションから、思考ブロックの真下に訳が出ます。思考が流れている間も、段落を書き終えるたびにその段落の訳が下に足されていくので、長い思考でも途中から日本語で読めます。訳は返答の本文が始まる前にほぼそろうため、あとから本文が押し下げられることもほとんどありません。`/thinking-ja` で表示を切り替えます。
+入力欄のすぐ上に、セッション開始時から字幕用の3行を確保します。訳が届くとその中身だけが切り替わります。会話の途中には行を追加しないので、読んでいる回答やツール結果が翻訳に押し出されません。
+
+思考の途中でも、書き終えた段落から順に訳します。改行のない長い段落も最大500字ずつに分けます。字幕に入りきらない訳や過去の訳は `/thinking-ja show` で全文を読めます。開いた画面は新着で動きません。`↑` `↓` でスクロール、`Esc` で会話に戻ります。`/thinking-ja` で字幕を止めると、その3行を返します。
 
 翻訳サーバーが落ちているときは、`@thinking-ja` ロール（未設定なら `@smol`）のモデルで訳します。この場合はモデルの利用料がかかり、訳は思考が終わってからまとめて出ます。
 
@@ -149,7 +151,7 @@ bun run typecheck:claude  # mod の型検査
 
 ## English
 
-thinking-ja shows a Japanese translation of a coding agent's thinking, made by a local translation model (any OpenAI-compatible endpoint; PLaMo 3 Translate recommended). Translations are display-only: model input and transcripts are never changed. It ships an inline extension for oh-my-pi, a card extension for pi, a Claude Code mod (needs `"showThinkingSummaries": true`), a DeepSeek Harness Web/Desktop plugin, and `thinking-ja watch`, a side viewer that follows transcripts of Claude Code, Codex, pi, omp and DSH. It is installed straight from GitHub with the commands above; configure translators in `~/.config/thinking-ja/config.json`.
+thinking-ja shows a Japanese translation of a coding agent's thinking, made by a local translation model (any OpenAI-compatible endpoint; PLaMo 3 Translate recommended). Translations are display-only: model input and transcripts are never changed. On oh-my-pi, translations update a fixed three-row caption above the editor without adding transcript rows; `/thinking-ja show` opens a scrollable snapshot. Other integrations include a card extension for pi, a Claude Code mod (needs `"showThinkingSummaries": true`), a DeepSeek Harness Web/Desktop plugin, and `thinking-ja watch`, a side viewer for Claude Code, Codex, pi, omp and DSH. Install from GitHub with the commands above; configure translators in `~/.config/thinking-ja/config.json`.
 
 ## License
 
