@@ -7,9 +7,9 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { Text, type Component } from "@oh-my-pi/pi-tui";
 import thinkingJa from "../src/harness/omp/index.ts";
 
-const TRANSLATION = "原文を保ったまま、確定した思考の日本語訳を表示する。";
-const PREFIX = "The original English reasoning is still growing.";
-const COMPLETE = `${PREFIX} Its final paragraph must also be translated.`;
+const ENDPOINT = "http://127.0.0.1:18095/v1/completions";
+const PREFIX = "The original English reasoning is still growing";
+const COMPLETE = `${PREFIX} and its final paragraph must also be translated.`;
 
 /**
  * The local translator endpoint, stubbed at `fetch`: answers `ローカル訳:<prompt>`,
@@ -19,15 +19,17 @@ const COMPLETE = `${PREFIX} Its final paragraph must also be translated.`;
 let translatorDown = false;
 /** Texts the local translator endpoint was asked to translate. */
 let localRequests: string[] = [];
+let destinations: string[] = [];
 const gates = new Map<string, Promise<void>>();
 const streams = new Map<string, ReadableStream<Uint8Array>>();
 const originalConfig = process.env.THINKING_JA_CONFIG;
 const realFetch = globalThis.fetch;
 globalThis.fetch = Object.assign(
-	async (_url: string | URL | Request, init?: RequestInit) => {
-		if (translatorDown) return new Response("down", { status: 503 });
+	async (url: string | URL | Request, init?: RequestInit) => {
+		destinations.push(String(url));
 		const body = JSON.parse(String(init?.body)) as { prompt: string };
 		localRequests.push(body.prompt);
+		if (translatorDown) return new Response("down", { status: 503 });
 		await gates.get(body.prompt);
 		const stream = streams.get(body.prompt);
 		if (stream) return new Response(stream, { headers: { "content-type": "text/event-stream" } });
@@ -37,7 +39,9 @@ globalThis.fetch = Object.assign(
 );
 const configDir = mkdtempSync(join(tmpdir(), "thinking-ja-omp-"));
 const configFile = join(configDir, "config.json");
-writeFileSync(configFile, JSON.stringify({ translators: [{ url: "http://translator.test/v1/completions", prompt: "{{text}}" }] }));
+writeFileSync(configFile, JSON.stringify({ translators: [{ url: ENDPOINT, prompt: "{{text}}" }] }));
+writeFileSync(join(configDir, "invalid.json"), "{");
+writeFileSync(join(configDir, "empty.json"), JSON.stringify({ translators: [] }));
 afterAll(() => {
 	globalThis.fetch = realFetch;
 	if (originalConfig === undefined) delete process.env.THINKING_JA_CONFIG;
@@ -47,19 +51,19 @@ afterAll(() => {
 beforeEach(() => {
 	translatorDown = false;
 	localRequests = [];
+	destinations = [];
 	gates.clear();
 	streams.clear();
-	process.env.THINKING_JA_CONFIG = join(configDir, "absent.json");
+	process.env.THINKING_JA_CONFIG = configFile;
 });
 
-type CacheEntry = { customType: string; data: { hash: string; ja: string; v: number; order?: number } };
+type CacheEntry = { type: "custom"; customType: string; data: { hash: string; ja: string; v: number; order?: number } };
 type Part = { type: "thinking"; thinking: string } | { type: "toolCall"; id: string };
 
 function harness(branch: CacheEntry[] = []) {
 	const events = new Map<string, (event: unknown, context: unknown) => unknown>();
 	const timers = new Map<number, { at: number; run: () => void }>();
-	/** Notes the LLM role path was asked to translate. */
-	const requests: string[] = [];
+	const modelCalls: string[] = [];
 	let now = 0;
 	let nextTimer = 0;
 	let renderer: (context: unknown, theme: unknown) => Component | undefined = () => undefined;
@@ -71,7 +75,7 @@ function harness(branch: CacheEntry[] = []) {
 	const context = {
 		cwd: "/test",
 		mode: "tui",
-		models: { resolve: () => ({ id: "test" }) },
+		models: { resolve(role: string) { modelCalls.push(role); return { id: "claude-sonnet-5" }; } },
 		modelRegistry: {},
 		sessionManager: { getBranch: () => branch },
 		setTimeout(run: () => void, delay: number) {
@@ -93,25 +97,9 @@ function harness(branch: CacheEntry[] = []) {
 	const pi = {
 		pi: {
 			Text,
-			SessionManager: { inMemory: () => ({}) },
-			AgentRegistry: class { },
-			async createAgentSession() {
-				let listener: ((event: unknown) => void) | undefined;
-				return {
-					session: {
-						subscribe(callback: typeof listener) {
-							listener = callback;
-							return () => {
-								listener = undefined;
-							};
-						},
-						async prompt(prompt: string) {
-							requests.push(prompt.split("<notes>\n")[1]!.split("\n</notes>")[0]!);
-							listener?.({ type: "turn_end", message: { content: [{ type: "text", text: TRANSLATION }] } });
-						},
-						async dispose() { },
-					},
-				};
+			createAgentSession() {
+				modelCalls.push("createAgentSession");
+				throw new Error("Thinking translation must never open a model session");
 			},
 		},
 		on(name: string, handler: (event: unknown, context: unknown) => unknown) {
@@ -123,12 +111,10 @@ function harness(branch: CacheEntry[] = []) {
 		registerCommand(_name: string, registration: { handler: (args: string, context: unknown) => Promise<void> }) {
 			command = (args) => registration.handler(args, context);
 		},
-		appendEntry(customType: string, data: CacheEntry["data"]) { branch.push({ customType, data }); },
+		appendEntry(customType: string, data: CacheEntry["data"]) { branch.push({ type: "custom", customType, data }); },
 		logger: {
 			debug() { },
-			warn(message: string) {
-				throw new Error(message);
-			},
+			warn() { },
 		},
 	};
 	thinkingJa(pi as unknown as ExtensionAPI);
@@ -144,7 +130,7 @@ function harness(branch: CacheEntry[] = []) {
 		}, context);
 	}
 	return {
-		requests,
+		modelCalls,
 		branch, render, update,
 		async emit(name: string) {
 			if (name === "message_start") parts = [];
@@ -171,7 +157,9 @@ function harness(branch: CacheEntry[] = []) {
 	};
 }
 
-test("a delayed role translation fills the original block's preallocated rows", async () => {
+test("a delayed configured translation fills the original block's preallocated rows", async () => {
+	const delayed = Promise.withResolvers<void>();
+	gates.set(COMPLETE, delayed.promise);
 	const h = harness();
 	await h.emit("session_start");
 	expect(h.rows()).toEqual([]);
@@ -181,17 +169,20 @@ test("a delayed role translation fills the original block's preallocated rows", 
 	expect(blank.length).toBeGreaterThan(0);
 	expect(blank.join("")).toBe("");
 	await h.advance(2000);
-	expect(h.requests).toEqual([]);
+	expect(localRequests).toEqual([]);
 	expect(h.rows()).toEqual(blank);
 	expect(h.think(COMPLETE)).toBe(view);
 	const reserved = h.rows().length;
 	await h.emit("message_end");
-	await h.advance(500);
-	expect(h.requests).toEqual([COMPLETE]);
+	await h.advance(0);
+	expect(h.rows().join("")).toBe("");
+	delayed.resolve();
+	await h.advance(0);
+	expect(localRequests).toEqual([COMPLETE]);
 	expect(h.rows()).toHaveLength(reserved);
-	expect(h.rows()[0]).toBe(TRANSLATION);
+	expect(h.rows()[0]).toBe(`ローカル訳:${COMPLETE}`);
 	expect(h.render(COMPLETE)).toBe(view);
-	expect(h.branch[0]?.data.ja).toBe(TRANSLATION);
+	expect(h.branch[0]?.data.ja).toBe(`ローカル訳:${COMPLETE}`);
 });
 
 test("a frame mounted before its final event receives the finished translation", async () => {
@@ -202,19 +193,20 @@ test("a frame mounted before its final event receives the finished translation",
 	const mounted = h.render(COMPLETE)!;
 	h.update(COMPLETE, 0, true);
 	await h.advance(500);
-	expect(mounted.render(160).join("").trim()).toBe(TRANSLATION);
-	expect(h.requests).toEqual([COMPLETE]);
+	expect(mounted.render(160).join("").trim()).toBe(`ローカル訳:${COMPLETE}`);
+	expect(localRequests).toEqual([COMPLETE]);
 });
 
-test("resume and toggling reuse complete translations without paying again", async () => {
+test("resume and toggling display cached translations even after the translator config is removed", async () => {
 	const first = harness();
 	await first.emit("session_start");
 	first.render(COMPLETE);
 	await first.advance(500);
 	const h = harness(first.branch);
+	process.env.THINKING_JA_CONFIG = join(configDir, "absent.json");
 	await h.emit("session_start");
 	h.render(COMPLETE);
-	expect(h.rows()[0]).toBe(TRANSLATION);
+	expect(h.rows()[0]).toBe(`ローカル訳:${COMPLETE}`);
 	await h.toggle();
 	expect(h.rows()).toEqual([]);
 	await h.emit("message_start");
@@ -223,9 +215,10 @@ test("resume and toggling reuse complete translations without paying again", asy
 	await h.advance(2000);
 	expect(h.rows()).toEqual([]);
 	await h.toggle();
-	expect(h.rows()[0]).toBe(TRANSLATION);
-	expect(await h.readAll()).toContain(TRANSLATION);
-	expect(h.requests).toEqual([]);
+	expect(h.rows()[0]).toBe(`ローカル訳:${COMPLETE}`);
+	expect(await h.readAll()).toContain(`ローカル訳:${COMPLETE}`);
+	expect(localRequests).toEqual([COMPLETE]);
+	expect(h.modelCalls).toEqual([]);
 });
 
 test("only the last visible frame is bought when it follows message_end", async () => {
@@ -236,17 +229,16 @@ test("only the last visible frame is bought when it follows message_end", async 
 	await h.toggle();
 	await h.toggle();
 	await h.advance(2000);
-	expect(h.requests).toEqual([]);
+	expect(localRequests).toEqual([]);
 	h.update(COMPLETE);
 	await h.emit("message_end");
 	h.render(COMPLETE);
 	await h.advance(500);
-	expect(h.requests).toEqual([COMPLETE]);
-	expect(h.rows()[0]).toBe(TRANSLATION);
+	expect(localRequests).toEqual([COMPLETE]);
+	expect(h.rows()[0]).toBe(`ローカル訳:${COMPLETE}`);
 });
 
-test("failed local service falls back after the visible block ends", async () => {
-	process.env.THINKING_JA_CONFIG = configFile;
+test("an offline translator skips the block without calling a model, and the next reply can recover", async () => {
 	translatorDown = true;
 	const h = harness();
 	await h.emit("session_start");
@@ -254,12 +246,37 @@ test("failed local service falls back after the visible block ends", async () =>
 	h.think(COMPLETE);
 	await h.emit("message_end");
 	await h.advance(500);
-	expect(h.requests).toEqual([COMPLETE]);
-	expect(h.rows()[0]).toBe(TRANSLATION);
+	expect(h.rows().join("")).toBe("");
+	expect(h.branch).toEqual([]);
+	expect(destinations).toEqual([ENDPOINT]);
+	expect(h.modelCalls).toEqual([]);
+	translatorDown = false;
+	await h.emit("message_start");
+	h.think(COMPLETE);
+	await h.emit("message_end");
+	await h.advance(0);
+	expect(h.rows()[0]).toBe(`ローカル訳:${COMPLETE}`);
+	expect(destinations).toEqual([ENDPOINT, ENDPOINT]);
+	expect(h.modelCalls).toEqual([]);
+});
+
+test.each(["absent.json", "invalid.json", "empty.json"])("%s never sends untranslated thinking to any model or endpoint", async (file) => {
+	process.env.THINKING_JA_CONFIG = join(configDir, file);
+	const h = harness();
+	await h.emit("session_start");
+	expect(h.render(COMPLETE)).toBeUndefined();
+	await h.emit("message_start");
+	h.think(PREFIX);
+	h.update(COMPLETE, 0, true);
+	expect(h.render(COMPLETE)).toBeUndefined();
+	await h.emit("message_end");
+	await h.advance(2000);
+	expect(destinations).toEqual([]);
+	expect(h.modelCalls).toEqual([]);
+	expect(h.branch).toEqual([]);
 });
 
 test("a completed paragraph remains under the same original after later paragraphs arrive and on replay", async () => {
-	process.env.THINKING_JA_CONFIG = configFile;
 	const h = harness();
 	await h.emit("session_start");
 	await h.emit("message_start");
@@ -284,11 +301,10 @@ test("a completed paragraph remains under the same original after later paragrap
 	expect(h.rows().filter(Boolean)).toEqual([`ローカル訳:${first}`, `ローカル訳:${second}`]);
 	await h.advance(1000);
 	expect(localRequests).toEqual([first, second]);
-	expect(h.requests).toEqual([]);
+	expect(h.modelCalls).toEqual([]);
 });
 
 test("post-tool local index zero closes at global index two even before its first frame", async () => {
-	process.env.THINKING_JA_CONFIG = configFile;
 	const h = harness();
 	await h.emit("session_start");
 	await h.emit("message_start");
@@ -316,7 +332,6 @@ test("post-tool local index zero closes at global index two even before its firs
 });
 
 test("folded or never-rendered provider text is not submitted to a translator", async () => {
-	process.env.THINKING_JA_CONFIG = configFile;
 	const h = harness();
 	await h.emit("session_start");
 	await h.emit("message_start");
@@ -331,7 +346,6 @@ test("folded or never-rendered provider text is not submitted to a translator", 
 });
 
 test("the first Japanese delta is visible before either stream ends; later sentences cannot overtake it", async () => {
-	process.env.THINKING_JA_CONFIG = configFile;
 	const first = "Check the source before making changes.";
 	const second = "Then inspect the tests.";
 	let writer!: ReadableStreamDefaultController<Uint8Array>;
@@ -363,23 +377,25 @@ test("the first Japanese delta is visible before either stream ends; later sente
 	expect(h.branch.map(entry => entry.data.ja)).toEqual([ja]);
 });
 
-test("a truncated live unit is not stored or bought again while the role supplies its full replacement", async () => {
-	process.env.THINKING_JA_CONFIG = configFile;
+test("a truncated local stream retracts its draft without discarding confirmed sentences or starting a model", async () => {
 	const h = harness();
 	await h.emit("session_start");
 	await h.emit("message_start");
 	let send!: ReadableStreamDefaultController<Uint8Array>;
 	streams.set(PREFIX, new ReadableStream({ start(c) { send = c; } }));
-	const view = h.think(PREFIX)!;
-	h.update(PREFIX, 0, true);
+	const first = "The first sentence translated successfully.";
+	const full = `${first}\n\n${PREFIX}`;
+	const view = h.think(full)!;
+	h.update(full, 0, true);
 	await h.advance(0);
 	send.enqueue(new TextEncoder().encode('data: {"choices":[{"text":"途切れた仮訳"}]}\n\n'));
 	await h.advance(0);
-	expect(view.render(80).join("").trim()).toBe("途切れた仮訳");
+	expect(view.render(160).map(line => line.trim()).filter(Boolean)).toEqual([`ローカル訳:${first}`, "途切れた仮訳"]);
 	send.enqueue(new TextEncoder().encode('data: {"choices":[{"text":"","finish_reason":"length"}]}\n\n'));
 	await h.advance(500);
-	expect(localRequests).toEqual([PREFIX]);
-	expect(h.requests).toEqual([PREFIX]);
-	expect(h.branch.map(entry => entry.data.ja)).toEqual([TRANSLATION]);
-	expect(view.render(80).join("").trim()).toBe(TRANSLATION);
+	expect(localRequests).toEqual([first, PREFIX]);
+	expect(destinations).toEqual([ENDPOINT, ENDPOINT]);
+	expect(h.modelCalls).toEqual([]);
+	expect(h.branch).toEqual([]);
+	expect(view.render(160).map(line => line.trim()).filter(Boolean)).toEqual([`ローカル訳:${first}`]);
 });

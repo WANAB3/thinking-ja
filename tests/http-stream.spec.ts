@@ -180,6 +180,27 @@ describe("requestStreamingTranslation", () => {
 		expect(fetch.mock.calls[1]![1]!.signal).toBe(fetch.mock.calls[0]![1]!.signal);
 	});
 
+	test("a redirect cannot forward source text to an unconfigured endpoint", async () => {
+		const paths: string[] = [];
+		const server = Bun.serve({
+			hostname: "127.0.0.1", port: 0,
+			fetch(req) {
+				const path = new URL(req.url).pathname;
+				paths.push(path);
+				return path === "/configured"
+					? Response.redirect(new URL("/unconfigured", req.url), 307)
+					: Response.json({ choices: [{ text: "unexpected" }] });
+			},
+		});
+		try {
+			const translator = { ...completion, url: new URL("/configured", server.url).href };
+			await expect(requestStreamingTranslation("Translate only here.", translator, cancellation().signal, () => { })).rejects.toThrow();
+			expect(paths).toEqual(["/configured"]);
+		} finally {
+			await server.stop(true);
+		}
+	});
+
 	test.each([
 		[400, "Invalid model"],
 		[400, "Invalid stream value"],

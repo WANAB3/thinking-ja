@@ -174,6 +174,8 @@ export const requestStreamingTranslation = async (
 	const post = (): Promise<Response> =>
 		fetch(translator.url, {
 			method: "POST",
+			// A 307/308 must not forward the original notes to an unconfigured URL.
+			redirect: "manual",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify(body),
 			signal: requestSignal,

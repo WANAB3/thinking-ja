@@ -20,7 +20,7 @@ llama-server -m ~/models-translate/plamo-3-translate-2b-Q4_K_M.gguf \
   --port 8095 -c 32768 -np 8 --sleep-idle-seconds 600
 ```
 
-- `-np 8` は、長い思考を 1500 字ずつ 8 並列で訳すため（`plamo-3-translate` プリセットの既定）。
+- `-np 8` はサーバー全体で同時に翻訳できる件数です。同じ URL を使う omp セッションはこの8枠を共有し、セッションごとにモデルを起動することはありません。
 - `--sleep-idle-seconds 600` は、10 分使わなければモデルをメモリから外す設定です。
 - PLaMo 3 Translate の重みは [PLaMo Community License](https://plamo.preferredai.jp/info/plamo-community-license-ja) です。個人利用は無料・登録不要です。
 
@@ -79,7 +79,7 @@ omp plugin install github:WANAB3/thinking-ja
 
 訳が届く前に、表示中の英文の長さ・改行・端末の横幅から行数を見積もります。英文の表示が先に更新されても、途中まで出た訳とその続きは、更新後の英文の下に残ります。見積もりに収まらない場合だけ、訳の完成時に一度広げて全文を表示します。3行の上限はありません。端末の変更できないスクロールバックに先に流れた場合も、`/thinking-ja show` で完成した訳を読めます。`Esc` で会話に戻り、`/thinking-ja` で翻訳を停止・再開できます。
 
-翻訳サーバーが落ちているときは、`@thinking-ja` ロール（未設定なら `@smol`）のモデルで訳します。この場合はモデルの利用料がかかり、訳は思考が終わってからまとめて出ます。
+思考の翻訳には `translators` に指定した URL だけを使い、HTTP リダイレクトにも従いません。設定がない場合や、指定した翻訳先がすべて失敗した場合は、新しい訳をスキップします。英文と、すでに訳し終えた文はそのままです。`@thinking-ja`・`@smol`・`@default` など、omp のチャットモデルには切り替えません。
 
 ### pi
 
@@ -152,6 +152,8 @@ bun run typecheck:claude  # mod の型検査
 ## English
 
 thinking-ja shows a Japanese translation of a coding agent's thinking, made by a local translation model (any OpenAI-compatible endpoint; PLaMo 3 Translate recommended). Translations are display-only: model input and transcripts are never changed. On oh-my-pi, each visible thinking block reserves space for its full translation based on the original text and terminal width. Sealed source sentences are translated while thinking continues, and streaming endpoints draw partial Japanese in place. Any overflow expands once when the block's translation finishes. `/thinking-ja show` opens a scrollable snapshot. Other integrations include a card extension for pi, a Claude Code mod (needs `"showThinkingSummaries": true`), a DeepSeek Harness Web/Desktop plugin, and `thinking-ja watch`, a side viewer for Claude Code, Codex, pi, omp and DSH. Install from GitHub with the commands above; configure translators in `~/.config/thinking-ja/config.json`.
+
+The omp extension sends thinking only to the configured translator URLs, not to redirect targets or a fallback chat model. If no endpoint is configured or all fail, it skips the unavailable translation. Sessions using the same URL share one translation server, not their translation history.
 
 ## License
 
