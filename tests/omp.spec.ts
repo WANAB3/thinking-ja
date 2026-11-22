@@ -194,6 +194,18 @@ test("a delayed role translation fills the original block's preallocated rows", 
 	expect(h.branch[0]?.data.ja).toBe(TRANSLATION);
 });
 
+test("a frame mounted before its final event receives the finished translation", async () => {
+	const h = harness();
+	await h.emit("session_start");
+	await h.emit("message_start");
+	h.think(PREFIX);
+	const mounted = h.render(COMPLETE)!;
+	h.update(COMPLETE, 0, true);
+	await h.advance(500);
+	expect(mounted.render(160).join("").trim()).toBe(TRANSLATION);
+	expect(h.requests).toEqual([COMPLETE]);
+});
+
 test("resume and toggling reuse complete translations without paying again", async () => {
 	const first = harness();
 	await first.emit("session_start");
@@ -329,23 +341,25 @@ test("the first Japanese delta is visible before either stream ends; later sente
 	await h.emit("session_start");
 	await h.emit("message_start");
 	const full = `${first} ${second}`;
-	const view = h.think(full)!;
+	const view = h.think(`${first} Then inspect`)!;
 	await h.advance(0);
 	expect(localRequests).toEqual([first]);
 	push({ choices: [{ index: 0, text: "まず原文を" }] });
 	await h.advance(0);
 	expect(view.render(80).join("").trim()).toBe("まず原文を");
 	expect(h.branch).toEqual([]);
+	const mounted = h.render(full)!;
 	h.update(full, 0, true);
+	expect(mounted.render(80).join("").trim()).toBe("まず原文を");
 	await h.advance(0);
 	expect(localRequests).toEqual([first, second]);
-	expect(view.render(80).join("").trim()).toBe("まず原文を");
+	expect(mounted.render(80).join("").trim()).toBe("まず原文を");
 	push({ choices: [{ index: 0, text: "確認する。", finish_reason: "stop" }] });
 	writer.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
 	writer.close();
 	await h.advance(0);
 	const ja = `まず原文を確認する。ローカル訳:${second}`;
-	expect(view.render(160).join("").trim()).toBe(ja);
+	expect(mounted.render(160).join("").trim()).toBe(ja);
 	expect(h.branch.map(entry => entry.data.ja)).toEqual([ja]);
 });
 

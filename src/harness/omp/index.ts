@@ -549,6 +549,17 @@ function openSession(pi: ExtensionAPI, context: ExtensionContext, config: Config
 
 	function observe(slot: Slot, text: string, previousView?: Inline): Inline {
 		let block = slot.block;
+		// The UI may already have mounted the newer frame before its event
+		// identifies the slot. Move both existing Japanese and future deltas to it.
+		if (block && previousView && previousView !== block.view) {
+			block.view = previousView;
+			if (block.drawn && text.startsWith(block.text)) {
+				const complete = block.final && block.text === text && translations.get(block.hash)?.status === "done";
+				previousView.setTranslation(plainText(block.drawn), complete);
+				if (complete) remember(historyViews, block.hash, previousView, 200);
+				redraw?.();
+			}
+		}
 		if (!block || block.text !== text) {
 			if (!block) {
 				block = slot.block = newBlock(text, slot.order, !translators.length, previousView);
