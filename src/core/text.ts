@@ -79,6 +79,26 @@ export const splitChunks = (text: string, max: number, level = 0): string[] => {
 	return chunks;
 };
 
+/**
+ * A block cut into translation units as it streams: every paragraph already
+ * closed by a blank line, cut with `splitChunks` when longer than `max`, and of
+ * the paragraph still being written every piece but its growing last one.
+ * `final` closes that paragraph too. A unit, once returned, comes back
+ * byte-identical however the block grows, so each is translated exactly once,
+ * as soon as it closes.
+ */
+export const paragraphUnits = (text: string, max: number, final: boolean): string[] => {
+	const cut = final ? text.length : text.lastIndexOf("\n\n");
+	const units: string[] = [];
+	for (const paragraph of cut > 0 ? text.slice(0, cut).split("\n\n") : []) {
+		const trimmed = paragraph.trim();
+		if (trimmed) units.push(...splitChunks(trimmed, max));
+	}
+	const open = final ? "" : text.slice(cut < 0 ? 0 : cut + 2).trim();
+	if (open.length > max) units.push(...splitChunks(open, max).slice(0, -1));
+	return units;
+};
+
 /** FNV-1a over the text, salted with its length: a stable cache key. */
 export const hashText = (text: string): string => {
 	let h = 0x811c9dc5;

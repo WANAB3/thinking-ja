@@ -36,11 +36,14 @@ const COMPLETE = `${PREFIX} Its final paragraph must also be translated.`;
  * drives every test.
  */
 let translatorDown = false;
+/** Texts the local translator endpoint was asked to translate. */
+let localRequests: string[] = [];
 const realFetch = globalThis.fetch;
 globalThis.fetch = Object.assign(
 	async (_url: string | URL | Request, init?: RequestInit) => {
 		if (translatorDown) return new Response("down", { status: 503 });
 		const body = JSON.parse(String(init?.body)) as { prompt: string };
+		localRequests.push(body.prompt);
 		return Response.json({ choices: [{ text: `ローカル訳:${body.prompt}` }] });
 	},
 	{ preconnect: realFetch.preconnect },
@@ -54,6 +57,7 @@ afterAll(() => {
 });
 beforeEach(() => {
 	translatorDown = false;
+	localRequests = [];
 	process.env.THINKING_JA_CONFIG = join(configDir, "absent.json");
 });
 
@@ -129,6 +133,12 @@ function harness() {
 		async emit(name: string) {
 			await events.get(name)?.({ message: { role: "assistant" } }, context);
 		},
+		async thinkingEnd(contentIndex: number) {
+			await events.get("message_update")?.(
+				{ message: { role: "assistant" }, assistantMessageEvent: { type: "thinking_end", contentIndex } },
+				context,
+			);
+		},
 		render(text: string) {
 			return renderer(
 				{ text, contentIndex: 0, thinkingIndex: 0, requestRender() { } },
@@ -138,16 +148,16 @@ function harness() {
 		toggle() {
 			return toggle();
 		},
-		/** Runs due timers in order, letting each one's async work settle. */
+		/** Settles pending async work, then runs due timers in order, settling after each. */
 		async advance(ms: number) {
 			const until = now + ms;
 			for (; ;) {
+				for (let i = 0; i < 20; i++) await setImmediate();
 				const due = [...timers.entries()].filter(([, timer]) => timer.at <= until).sort((a, b) => a[1].at - b[1].at)[0];
 				if (!due) break;
 				now = due[1].at;
 				timers.delete(due[0]);
 				due[1].run();
-				for (let i = 0; i < 20; i++) await setImmediate();
 			}
 			now = until;
 		},
@@ -236,4 +246,34 @@ test("a local translator that is down falls back to the LLM role", async () => {
 	await h.advance(500);
 	expect(h.requests).toEqual([COMPLETE]);
 	expect(view.render(80)).toEqual([TRANSLATION]);
+});
+
+test("closed paragraphs are translated while the thinking streams; the open one follows thinking_end", async () => {
+	process.env.THINKING_JA_CONFIG = configFile;
+	const h = harness();
+	await h.emit("session_start");
+	await h.emit("message_start");
+	const first = "The first paragraph is already closed.";
+	const second = "The second paragraph is still being written";
+	const view = h.render(`${first}\n\n${second}`)!;
+	await h.advance(0);
+	expect(view.render(80)).toEqual([`ローカル訳:${first}`]);
+	expect(localRequests).toEqual([first]);
+	const full = `${first}\n\n${second}, and now it is done.`;
+	h.render(full);
+	await h.thinkingEnd(0);
+	await h.advance(0);
+	expect(view.render(80)).toEqual([`ローカル訳:${first}`, `ローカル訳:${second}, and now it is done.`]);
+	expect(localRequests).toEqual([first, `${second}, and now it is done.`]);
+	expect(h.requests).toEqual([]);
+
+	// The finished block is cached whole: a later redraw of it buys nothing.
+	await h.emit("message_end");
+	await h.emit("message_start");
+	await h.emit("message_end");
+	const redrawn = h.render(full)!;
+	await h.advance(1000);
+	expect(redrawn.render(80)).toEqual(view.render(80));
+	expect(localRequests).toHaveLength(2);
+	expect(h.requests).toEqual([]);
 });

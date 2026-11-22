@@ -19,15 +19,19 @@ export type ChunkCache = {
 	set(key: string, value: string): void;
 };
 
-export type BlockOptions = {
+/** How one chunk is translated: `attempts` in order, results cached by chunk hash. */
+export type ChunkOptions = {
 	attempts: readonly ChunkAttempt[];
-	chunkChars: number;
-	concurrency: number;
 	signal: AbortSignal;
-	/** Checked before every attempt; false abandons the block. */
+	/** Checked before every attempt; false abandons the chunk. */
 	active?: () => boolean;
 	cache?: ChunkCache;
 	onAttemptError?: (error: unknown, attempt: number) => void;
+};
+
+export type BlockOptions = ChunkOptions & {
+	chunkChars: number;
+	concurrency: number;
 };
 
 export const translatorAttempts = (translators: readonly Translator[], post: HttpPost): ChunkAttempt[] =>
@@ -40,13 +44,38 @@ export const chunkPlan = (translators: readonly Translator[]): { chunkChars: num
 });
 
 /**
- * A whole block's translation: split into chunks, up to `concurrency` chunks
- * at a time, each walking `attempts` in order, then joined in order. Resolves
- * undefined when abandoned (aborted, or `active()` turned false before an
- * attempt); rejects with the last error once a chunk failed every attempt, so
- * a caller never shows a translation with a hole in it. Chunks still in
- * flight at that point finish into the cache, so a retry re-buys only what
+ * One chunk's translation, from the cache or from the first attempt that
+ * answers. Resolves undefined when abandoned (aborted, or `active()` turned
+ * false before an attempt); rejects with the last error once every attempt
  * failed.
+ */
+export const translateChunk = async (chunk: string, options: ChunkOptions): Promise<string | undefined> => {
+	const key = hashText(chunk);
+	const cached = options.cache?.get(key);
+	if (cached !== undefined) return cached;
+	let lastError: unknown = new Error("no translator configured");
+	for (const [index, attempt] of options.attempts.entries()) {
+		if (options.signal.aborted || options.active?.() === false) return undefined;
+		try {
+			const ja = (await attempt(chunk, options.signal)).trim();
+			if (!ja) throw new Error("empty translation");
+			options.cache?.set(key, ja);
+			return ja;
+		} catch (error) {
+			lastError = error;
+			options.onAttemptError?.(error, index + 1);
+		}
+	}
+	throw lastError;
+};
+
+/**
+ * A whole block's translation: split into chunks, up to `concurrency` chunks
+ * at a time, each through `translateChunk`, then joined in order. Resolves
+ * undefined when abandoned; rejects with the last error once a chunk failed
+ * every attempt, so a caller never shows a translation with a hole in it.
+ * Chunks still in flight at that point finish into the cache, so a retry
+ * re-buys only what failed.
  */
 export const translateBlock = async (text: string, options: BlockOptions): Promise<string | undefined> => {
 	const chunks = splitChunks(text, options.chunkChars);
@@ -55,33 +84,13 @@ export const translateBlock = async (text: string, options: BlockOptions): Promi
 	let abandoned = false;
 	let failure: { error: unknown } | undefined;
 
-	const translateChunk = async (chunk: string): Promise<string | undefined> => {
-		const key = hashText(chunk);
-		const cached = options.cache?.get(key);
-		if (cached !== undefined) return cached;
-		let lastError: unknown = new Error("no translator configured");
-		for (const [index, attempt] of options.attempts.entries()) {
-			if (options.signal.aborted || options.active?.() === false) return undefined;
-			try {
-				const ja = (await attempt(chunk, options.signal)).trim();
-				if (!ja) throw new Error("empty translation");
-				options.cache?.set(key, ja);
-				return ja;
-			} catch (error) {
-				lastError = error;
-				options.onAttemptError?.(error, index + 1);
-			}
-		}
-		throw lastError;
-	};
-
 	const worker = async () => {
 		while (!abandoned && !failure && next < chunks.length) {
 			const index = next++;
 			const chunk = chunks[index];
 			if (chunk === undefined) break;
 			try {
-				const ja = await translateChunk(chunk);
+				const ja = await translateChunk(chunk, options);
 				if (ja === undefined) abandoned = true;
 				else parts[index] = ja;
 			} catch (error) {

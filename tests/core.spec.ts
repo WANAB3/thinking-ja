@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { chunkPlan, translateBlock, translatorAttempts } from "../src/core/block.ts";
 import { parseConfig } from "../src/core/config.ts";
 import { fetchPost } from "../src/core/http.ts";
-import { shouldTranslate, splitChunks, toLines } from "../src/core/text.ts";
+import { paragraphUnits, shouldTranslate, splitChunks, toLines } from "../src/core/text.ts";
 import { requestTranslation } from "../src/core/translator.ts";
 
 /** A fake OpenAI-compatible server: echoes `訳:` + the text it was asked to translate. */
@@ -83,6 +83,17 @@ describe("text gates", () => {
 		expect(a.length).toBeGreaterThan(1);
 		expect(b.slice(0, a.length - 1)).toEqual(a.slice(0, -1));
 		expect(b.every((chunk) => chunk.length <= 700)).toBe(true);
+	});
+
+	test("streaming units: closed paragraphs and settled pieces only, unchanged as the block grows", () => {
+		expect(paragraphUnits("Alpha.\n\nBeta is open", 100, false)).toEqual(["Alpha."]);
+		expect(paragraphUnits("Alpha.\n\nBeta is open", 100, true)).toEqual(["Alpha.", "Beta is open"]);
+		const long = "word ".repeat(80).trim();
+		const growing = paragraphUnits(`Alpha.\n\n${long}`, 100, false);
+		expect(growing.length).toBeGreaterThan(2);
+		expect(paragraphUnits(`Alpha.\n\n${long} more words here`, 100, false).slice(0, growing.length)).toEqual(growing);
+		expect(paragraphUnits(`Alpha.\n\n${long} end.\n\nGamma`, 100, false).slice(0, growing.length)).toEqual(growing);
+		expect(paragraphUnits(`Alpha.\n\n${long} end.`, 100, true).join(" ")).toBe(`Alpha. ${long} end.`);
 	});
 });
 

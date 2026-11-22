@@ -1,10 +1,10 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import type { Component } from "@oh-my-pi/pi-tui";
-import { type ChunkAttempt, chunkPlan, translateBlock, translatorAttempts } from "../../core/block.ts";
+import { type ChunkAttempt, chunkPlan, translateBlock, translateChunk, translatorAttempts } from "../../core/block.ts";
 import type { Config } from "../../core/config.ts";
 import { fetchPost } from "../../core/http.ts";
 import { configPath, loadConfig } from "../../core/load.ts";
-import { hashText, MIN_TRANSLATABLE_CHARS, shouldTranslate, toLines } from "../../core/text.ts";
+import { hashText, MIN_TRANSLATABLE_CHARS, paragraphUnits, shouldTranslate, toLines } from "../../core/text.ts";
 
 /**
  * oh-my-pi adapter: renders a Japanese translation directly under every
@@ -18,18 +18,22 @@ import { hashText, MIN_TRANSLATABLE_CHARS, shouldTranslate, toLines } from "../.
  * — TUI components, SDK factories — comes from `pi.pi`, the host's own
  * package-export bag.
  *
- * Display: streaming thinking is append-only, but inserting a growing
- * translation underneath it changes the mutable tail's height. Under viewport
- * pressure this can erase original rows that were visible in the previous
- * frame. Keep a separate, empty container for each streaming block and only
- * schedule/display its translation after the assistant's `message_end`.
- * Cached translations follow the same rule; a cache hit must not reintroduce
- * mid-stream layout changes.
+ * Display: with configured translators, a reply's thinking is translated
+ * paragraph by paragraph while it streams. Each paragraph closed by a blank
+ * line goes to the translators at once, and translations show under the
+ * block in order, as far as every earlier paragraph is done; the paragraph
+ * still being written follows when the thinking ends (`thinking_end`, else
+ * `message_end`). The translation so grows at the bottom of the live reply
+ * while the thinking is the last thing in it, and is mostly in place before
+ * the reply's text starts below it, which a late translation pushes down.
+ *
+ * Without configured translators, or once they fail a paragraph, a live
+ * block shows nothing until its thinking or reply ends; then the whole block
+ * goes through every translator and the LLM roles.
  *
  * `requestRender()` repaints mounted components rather than invoking the
- * renderer again. Promote the retained empty containers on completion so a
- * thinking-only message can receive its translation without another rebuild.
- * A translation arriving after its finalized block was committed to native
+ * renderer again, so asynchronous results repaint the mounted containers
+ * themselves. A translation arriving after its block was committed to native
  * scrollback remains cached for resume; it cannot rewrite terminal history.
  *
  * No status labels: pending and failed both render nothing at all. A
@@ -62,12 +66,14 @@ import { hashText, MIN_TRANSLATABLE_CHARS, shouldTranslate, toLines } from "../.
  * what shows: a translation that lands after its block reached scrollback
  * stays off screen.
  *
- * Cost model: one call per chunk of finalized thinking text, free on a local
- * translator and paid on the LLM roles. Streaming prefixes never buy
- * translations. The final renderer may flush text after `message_end`, so
- * per-slot debounce coalesces that last update. Blocks that are already
- * Japanese (the kana-dominance gate) are not translated at all, and every path
- * that would buy a request is gated on the runtime toggle.
+ * Cost model: configured translators get one request per paragraph as it
+ * closes; the LLM roles one per chunk of a finished block, and only for blocks
+ * no configured translator served. A paragraph still being written never buys
+ * a translation. On the whole-block path the final renderer may flush text
+ * after `message_end`, so per-slot debounce coalesces that last update.
+ * Blocks that are already Japanese (the kana-dominance gate) are not
+ * translated at all, and every path that would buy a request is gated on the
+ * runtime toggle.
  */
 
 /** Coalesce the final renderer flush and back off while MAX_INFLIGHT is full. */
@@ -89,6 +95,12 @@ const MAX_TRANSLATIONS = 2000;
 const MAX_CHUNKS = 512;
 /** Deadline for one LLM-role translation. */
 const REQUEST_TIMEOUT_MS = 60_000;
+/**
+ * Largest unit a live block is translated in, below the translator's own
+ * `chunkChars`. Translations show in order, so one long unit holds back every
+ * paragraph after it; 500 chars is a few seconds of a local 2B translator.
+ */
+const UNIT_CHARS = 500;
 /**
  * Dedicated translation model role, mapped in config.yml
  * (`modelRoles.thinking-ja: <provider>/<model-id>`) or from `/model`'s Roles
@@ -187,6 +199,25 @@ type BlockState = {
 	busy: boolean;
 };
 
+/** A thinking block of the reply being drawn, or of one whose translation is still landing. */
+type LiveBlock = {
+	key: string;
+	contentIndex: number;
+	text: string;
+	/** Mounted under the block for the life of the reply. */
+	view: ContainerInstance;
+	/** The thinking ended, so its open paragraph is a unit too. */
+	final: boolean;
+	/** A paragraph failed every configured translator: the whole-block path takes over. */
+	failed: boolean;
+	/** Handed to the whole-block path, which draws through the shared view. */
+	promoted: boolean;
+	/** The lines drawn into `view`, so a refresh that changes nothing repaints nothing. */
+	drawn: string[];
+	/** Hash of the text whose finished translation was settled. */
+	settled?: string;
+};
+
 /* --------------------------------------------------------- history seeding */
 
 /**
@@ -235,8 +266,17 @@ export default function thinkingJa(pi: ExtensionAPI) {
 	const views = new Map<string, ContainerInstance>();
 	/** block identity -> that block's live debounce/in-flight slot */
 	const blocks = new Map<string, BlockState>();
-	/** Empty live views are separate even when their text has a cached translation. */
-	const streamingViews = new Map<string, { hash: string; text: string; view: ContainerInstance }>();
+	/** blockKey -> thinking blocks of the reply on screen; cleared when the next reply starts. */
+	const live = new Map<string, LiveBlock>();
+	/** Blocks of earlier replies whose paragraphs are still being translated. */
+	const settling = new Set<LiveBlock>();
+	/** Paragraph units waiting for a configured translator, oldest first. */
+	const unitQueue: string[] = [];
+	/** Unit hashes queued or in flight. */
+	const unitsPending = new Set<string>();
+	/** Unit hashes every configured translator failed during this reply. */
+	const unitsFailed = new Set<string>();
+	let unitsActive = 0;
 	let streaming = false;
 
 	let runtime: Runtime | undefined;
@@ -525,6 +565,132 @@ export default function thinkingJa(pi: ExtensionAPI) {
 		arm(blockKey, state);
 	}
 
+	/* ------------------------------------------------------------ live blocks */
+
+	/** Configured translators serve this session, so live blocks translate paragraph by paragraph. */
+	const hasTranslators = () => (config?.translators.length ?? 0) > 0;
+
+	/** Redraw a live block's container when its lines changed; true when they did. */
+	const draw = (block: LiveBlock, lines: string[]): boolean => {
+		const style = dim;
+		const shown = enabled && style ? lines : [];
+		if (shown.length === block.drawn.length && shown.every((line, index) => line === block.drawn[index])) return false;
+		block.drawn = shown;
+		block.view.clear();
+		if (style) for (const line of shown) block.view.addChild(new host.Text(style(line), 1, 0));
+		return true;
+	};
+
+	/**
+	 * Hand a live block to the whole-block path, once: mount the shared view for
+	 * its text under it, and translate the block unless something already has.
+	 */
+	const promote = (block: LiveBlock) => {
+		if (block.promoted) return;
+		block.promoted = true;
+		const hash = hashText(block.text);
+		let view = views.get(hash);
+		if (!view) {
+			view = new host.Container();
+			remember(views, hash, view, MAX_VIEWS);
+		}
+		block.view.clear();
+		block.drawn = [];
+		// Share the cached content so toggling also updates older mounted copies.
+		block.view.addChild(view);
+		paint(hash);
+		if (!translations.has(hash)) track(block.key, block.text, hash);
+	};
+
+	/**
+	 * Bring a live block up to date: queue its closed paragraphs nobody has
+	 * translated yet, draw the translations of the leading paragraphs that are
+	 * done, and settle the block once its thinking ended and every paragraph is
+	 * done. A paragraph that failed every configured translator hands the block
+	 * to the whole-block path, at once when its thinking already ended. True
+	 * when the container changed.
+	 */
+	const refresh = (block: LiveBlock): boolean => {
+		if (block.failed || !hasTranslators()) return false;
+		const unitChars = Math.min(UNIT_CHARS, chunkPlan(config?.translators ?? []).chunkChars);
+		const units = paragraphUnits(block.text, unitChars, block.final);
+		const lines: string[] = [];
+		let complete = true;
+		for (const unit of units) {
+			const key = hashText(unit);
+			const ja = chunkTranslations.get(key);
+			if (ja !== undefined) {
+				if (complete) lines.push(...toLines(ja));
+				continue;
+			}
+			complete = false;
+			if (unitsFailed.has(key)) {
+				block.failed = true;
+				if (block.final) promote(block);
+				else draw(block, []);
+				return true;
+			}
+			if (enabled && !unitsPending.has(key)) {
+				unitsPending.add(key);
+				unitQueue.push(unit);
+			}
+		}
+		pumpUnits();
+		const changed = draw(block, lines);
+		if (complete && block.final && units.length > 0) {
+			const hash = hashText(block.text);
+			if (block.settled !== hash) {
+				block.settled = hash;
+				settle(hash, { status: "done", lines });
+			}
+		}
+		return changed;
+	};
+
+	/** Refresh every live and settling block, and ask for a render when one changed. */
+	const refreshLive = () => {
+		let changed = false;
+		for (const block of live.values()) changed = refresh(block) || changed;
+		for (const block of settling) {
+			changed = refresh(block) || changed;
+			if (block.settled !== undefined || block.failed) settling.delete(block);
+		}
+		if (changed) requestRender?.();
+	};
+
+	/** Start queued paragraph translations, up to the first translator's concurrency. */
+	const pumpUnits = () => {
+		const translators = config?.translators ?? [];
+		const { concurrency } = chunkPlan(translators);
+		while (unitsActive < concurrency) {
+			const unit = unitQueue.shift();
+			if (unit === undefined) return;
+			const key = hashText(unit);
+			unitsActive++;
+			translateChunk(unit, {
+				attempts: translatorAttempts(translators, fetchPost),
+				signal: sessionAbort.signal,
+				active: () => enabled,
+				cache: {
+					get: (cacheKey) => chunkTranslations.get(cacheKey),
+					set: (cacheKey, value) => remember(chunkTranslations, cacheKey, value, MAX_CHUNKS),
+				},
+				onAttemptError: (error, attempt) =>
+					pi.logger.debug(`thinking-ja: paragraph attempt ${attempt} failed: ${String(error)}`),
+			})
+				.catch((error: unknown) => {
+					unitsFailed.add(key);
+					pi.logger.debug(`thinking-ja: paragraph translation gave up: ${String(error)}`);
+				})
+				.finally(() => {
+					unitsActive--;
+					unitsPending.delete(key);
+					refreshLive();
+					pumpUnits();
+				});
+		}
+	};
+
 	/* ---------------------------------------------------------------- events */
 
 	/** Cache one persisted item; `true` when it was new to this session. */
@@ -585,25 +751,39 @@ export default function thinkingJa(pi: ExtensionAPI) {
 	pi.on("message_start", (event) => {
 		if (event.message.role !== "assistant") return;
 		streaming = true;
-		streamingViews.clear();
+		// Blocks still waiting for paragraphs keep filling their own containers.
+		for (const block of live.values()) {
+			if (!block.failed && block.settled === undefined && hasTranslators()) settling.add(block);
+		}
+		live.clear();
+		unitsFailed.clear();
+	});
+
+	// A thinking block that ended translates its last paragraph now, before
+	// the reply's text grows below it.
+	pi.on("message_update", (event) => {
+		const update = event.assistantMessageEvent;
+		if (update.type !== "thinking_end") return;
+		let changed = false;
+		for (const block of live.values()) {
+			if (block.contentIndex !== update.contentIndex || block.final) continue;
+			block.final = true;
+			changed = refresh(block) || changed;
+		}
+		if (changed) requestRender?.();
 	});
 
 	pi.on("message_end", (event) => {
 		if (event.message.role !== "assistant") return;
 		streaming = false;
-		for (const [blockKey, block] of streamingViews) {
-			let view = views.get(block.hash);
-			if (!view) {
-				view = new host.Container();
-				remember(views, block.hash, view, MAX_VIEWS);
-			}
-			// Share the cached content so toggling also updates older mounted copies.
-			block.view.addChild(view);
-			paint(block.hash);
-			if (!translations.has(block.hash)) track(blockKey, block.text, block.hash);
+		for (const block of live.values()) {
+			block.final = true;
+			if (!hasTranslators() || block.failed) promote(block);
+			else refresh(block);
 		}
-		if (streamingViews.size > 0) requestRender?.();
-		streamingViews.clear();
+		if (live.size > 0) requestRender?.();
+		// Without translators the shared views draw every block from here on.
+		if (!hasTranslators()) live.clear();
 	});
 
 	// Sessions from the superseded message-delivery build still carry its
@@ -621,7 +801,11 @@ export default function thinkingJa(pi: ExtensionAPI) {
 			if (state.timer !== undefined) runtime?.clearTimer(state.timer);
 		}
 		blocks.clear();
-		streamingViews.clear();
+		live.clear();
+		settling.clear();
+		unitQueue.length = 0;
+		unitsPending.clear();
+		unitsFailed.clear();
 		streaming = false;
 		views.clear();
 		translations.clear();
@@ -648,6 +832,7 @@ export default function thinkingJa(pi: ExtensionAPI) {
 			// Renderers are re-invoked only when a message rebuilds, so repaint the
 			// blocks already on screen instead of waiting for the next turn.
 			for (const hash of views.keys()) paint(hash);
+			for (const block of [...live.values(), ...settling]) refresh(block);
 			ctx.ui.notify(
 				enabled ? "thinking-ja: 思考ブロックの日本語訳を表示します" : "thinking-ja: 思考ブロックの日本語訳を停止しました",
 				"info",
@@ -668,16 +853,22 @@ export default function thinkingJa(pi: ExtensionAPI) {
 
 		const hash = hashText(text);
 		const blockKey = `${context.contentIndex}:${context.thinkingIndex}:${text.slice(0, MIN_TRANSLATABLE_CHARS)}`;
-		if (streaming) {
-			let block = streamingViews.get(blockKey);
-			if (!block) {
-				block = { hash, text, view: new host.Container() };
-				streamingViews.set(blockKey, block);
-			} else {
-				block.hash = hash;
-				block.text = text;
-			}
-			return block.view;
+		const block = live.get(blockKey);
+		if (streaming || (block && !block.failed && hasTranslators())) {
+			const current = block ?? {
+				key: blockKey,
+				contentIndex: context.contentIndex,
+				text,
+				view: new host.Container(),
+				final: false,
+				failed: false,
+				promoted: false,
+				drawn: [],
+			};
+			current.text = text;
+			live.set(blockKey, current);
+			refresh(current);
+			return current.view;
 		}
 
 		let view = views.get(hash);
